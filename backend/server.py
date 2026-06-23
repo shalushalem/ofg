@@ -139,6 +139,7 @@ def init_db() -> None:
             """
         )
         seed(db)
+        ensure_demo_login(db)
 
 
 def seed(db: sqlite3.Connection) -> None:
@@ -210,6 +211,49 @@ def seed(db: sqlite3.Connection) -> None:
             ("c_2", "v_grace", "u_corner", "Cornerstone", "Amen. Powerful word.", now_iso()),
         ],
     )
+    db.commit()
+
+
+def ensure_demo_login(db: sqlite3.Connection) -> None:
+    """Keep the test account predictable across local DB edits/restarts."""
+    digest, salt = hash_password("password123")
+    existing = db.execute(
+        "SELECT id FROM users WHERE email = ?", ("demo@ofg.local",)
+    ).fetchone()
+    if existing:
+        db.execute(
+            """
+            UPDATE users
+            SET name = ?, handle = ?, password_hash = ?, salt = ?, subscription = ?
+            WHERE email = ?
+            """,
+            (
+                "Aria Kade",
+                "@ariakade",
+                digest,
+                salt,
+                "Pro",
+                "demo@ofg.local",
+            ),
+        )
+    else:
+        db.execute(
+            """
+            INSERT INTO users(id, name, email, handle, password_hash, salt, bio, subscription, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "u_demo",
+                "Aria Kade",
+                "demo@ofg.local",
+                "@ariakade",
+                digest,
+                salt,
+                "Sharing faith, worship and teaching through OFG Connects.",
+                "Pro",
+                now_iso(),
+            ),
+        )
     db.commit()
 
 
