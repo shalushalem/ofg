@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+ofg_connects.db
+ofg_local.db
+media/
+*.log
+.DS_Store

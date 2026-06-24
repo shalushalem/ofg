@@ -1,4 +1,4 @@
-package com.ofgconnects.ofg_mobile
+package com.ofgconnects.app
 
 import io.flutter.embedding.android.FlutterActivity
 

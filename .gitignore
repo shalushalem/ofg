@@ -1,0 +1,31 @@
+# Root gitignore
+.git/
+*.db
+*.log
+
+# Backend
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/ofg_connects.db
+backend/ofg_local.db
+backend/media/
+backend/.env
+
+# Flutter
+ofg_mobile/.dart_tool/
+ofg_mobile/build/
+ofg_mobile/.flutter-plugins
+ofg_mobile/.flutter-plugins-dependencies
+ofg_mobile/android/.gradle/
+ofg_mobile/android/.kotlin/
+ofg_mobile/android/local.properties
+ofg_mobile/android/key.properties
+ofg_mobile/*.iml
+ofg_mobile/**/*.iml
+
+# IDE
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

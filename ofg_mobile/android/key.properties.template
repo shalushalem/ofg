@@ -1,0 +1,15 @@
+# OFG Connects — Keystore Signing Properties
+# This file is gitignored. Never commit it.
+# Run the keytool command below to generate your keystore, then fill in these values.
+#
+# HOW TO GENERATE YOUR KEYSTORE (run once, keep the .jks file forever):
+# ------------------------------------------------------------------
+# keytool -genkey -v -keystore ofg_connects_release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias ofg_connects
+# ------------------------------------------------------------------
+# Put ofg_connects_release.jks in: e:/ofg/ofg_mobile/android/
+# Then fill in the values below:
+
+storeFile=../ofg_connects_release.jks
+storePassword=YOUR_STORE_PASSWORD
+keyAlias=ofg_connects
+keyPassword=YOUR_KEY_PASSWORD

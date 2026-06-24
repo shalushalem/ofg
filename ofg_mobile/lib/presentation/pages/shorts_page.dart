@@ -1,10 +1,12 @@
-// lib/presentation/pages/shorts_page.dart
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../../logic/providers.dart';
-import '../../models/ofg_models.dart';
+import 'package:share_plus/share_plus.dart';
 import '../theme/ofg_theme.dart';
+import '../widgets/ofg_ui.dart';
 import '../widgets/local_video_player.dart';
+import '../../models/ofg_models.dart';
+import '../../logic/providers.dart';
+import '../../api/api_client.dart';
 
 class ShortsPage extends ConsumerStatefulWidget {
   final Function(OfgVideo) onCommentTap;
@@ -16,117 +18,367 @@ class ShortsPage extends ConsumerStatefulWidget {
 }
 
 class _ShortsPageState extends ConsumerState<ShortsPage> {
-  int _shortIndex = 0;
+  int _currentIndex = 0;
+  final Map<String, bool> _likedMap = {};
+  final Map<String, bool> _savedMap = {};
+  final Map<String, int> _likeCountMap = {};
 
-  String _resolveVideoUrl(String path) {
-    if (path.isEmpty) return 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4';
-    if (path.startsWith('http')) return path;
-    final baseUrl = ref.read(apiClientProvider).baseUrl;
-    return '${baseUrl.replaceAll(RegExp(r'/$'), '')}$path';
+  Future<void> _toggleLike(OfgVideo video) async {
+    final isLiked = _likedMap[video.id] ?? video.liked;
+    setState(() {
+      _likedMap[video.id] = !isLiked;
+      _likeCountMap[video.id] = (_likeCountMap[video.id] ?? video.likes) + (isLiked ? -1 : 1);
+    });
+
+    try {
+      final res = await ref.read(apiClientProvider).post('/videos/${video.id}/like', {});
+      setState(() {
+        _likedMap[video.id] = res['liked'] as bool? ?? _likedMap[video.id]!;
+        _likeCountMap[video.id] = res['likeCount'] as int? ?? _likeCountMap[video.id]!;
+      });
+    } catch (e) {
+      // Revert on error
+      setState(() {
+        _likedMap[video.id] = isLiked;
+        _likeCountMap[video.id] = (_likeCountMap[video.id] ?? video.likes) + (isLiked ? 1 : -1);
+      });
+    }
+  }
+
+  Future<void> _toggleSave(OfgVideo video) async {
+    final isSaved = _savedMap[video.id] ?? video.saved;
+    setState(() {
+      _savedMap[video.id] = !isSaved;
+    });
+
+    try {
+      final res = await ref.read(apiClientProvider).post('/videos/${video.id}/save', {});
+      setState(() {
+        _savedMap[video.id] = res['saved'] as bool? ?? _savedMap[video.id]!;
+      });
+    } catch (e) {
+      setState(() {
+        _savedMap[video.id] = isSaved;
+      });
+    }
+  }
+
+  void _share(OfgVideo video) {
+    Share.share('Check out ${video.title} on OFG Connects!');
+  }
+
+  void _showComments(OfgVideo video) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) => _CommentSheet(video: video),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final shortsAsync = ref.watch(shortsProvider);
 
-    return shortsAsync.when(
-      loading: () => const Center(child: CircularProgressIndicator(color: kAccent)),
-      error: (err, stack) => const Center(child: Text("Error loading shorts.", style: TextStyle(color: Colors.white))),
-      data: (shorts) {
-        if (shorts.isEmpty) return const Center(child: Text("No shorts available."));
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        children: [
+          shortsAsync.when(
+            data: (shorts) {
+              if (shorts.isEmpty) {
+                return const Center(
+                  child: Text('No shorts available. Check back soon!', style: TextStyle(color: Colors.white)),
+                );
+              }
+              return PageView.builder(
+                scrollDirection: Axis.vertical,
+                itemCount: shorts.length,
+                onPageChanged: (index) {
+                  setState(() => _currentIndex = index);
+                  // Trigger watch event
+                  ref.read(apiClientProvider).post('/videos/${shorts[index].id}/watch', {
+                    'watchTime': 2,
+                    'completionRate': 0,
+                    'progress': 0,
+                  }).catchError((_) {});
+                },
+                itemBuilder: (context, index) {
+                  final video = shorts[index];
+                  final isLiked = _likedMap[video.id] ?? video.liked;
+                  final isSaved = _savedMap[video.id] ?? video.saved;
+                  final likeCount = _likeCountMap[video.id] ?? video.likes;
 
-        return PageView.builder(
-          scrollDirection: Axis.vertical,
-          controller: PageController(initialPage: _shortIndex),
-          onPageChanged: (index) => setState(() => _shortIndex = index),
-          itemCount: shorts.length,
-          itemBuilder: (context, index) {
-            final short = shorts[index];
-            return Stack(
-              children: [
-                Positioned.fill(
-                  child: LocalVideoPlayer(
-                    url: _resolveVideoUrl(short.mediaUrl),
-                    isShort: true,
-                    shouldPlay: index == _shortIndex,
-                  ),
-                ),
-                SafeArea(
-                  child: Align(
-                    alignment: Alignment.topCenter,
-                    child: Padding(
-                      padding: const EdgeInsets.only(top: 18),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: const [
-                          Text('Following', style: TextStyle(color: Colors.white54)),
-                          SizedBox(width: 22),
-                          Text('For You', style: TextStyle(fontWeight: FontWeight.w900, fontSize: 15)),
-                          SizedBox(width: 22),
-                          Text('Trending', style: TextStyle(color: Colors.white54)),
-                        ],
-                      ),
-                    ),
-                  ),
-                ),
-                Positioned(
-                  right: 12,
-                  bottom: 120,
-                  child: Column(
+                  return Stack(
+                    fit: StackFit.expand,
                     children: [
-                      const CircleAvatar(
-                        radius: 24,
-                        backgroundColor: Colors.white,
-                        child: CircleAvatar(radius: 21, backgroundColor: kPanel2, child: Icon(Icons.person, color: Colors.white70)),
+                      LocalVideoPlayer(
+                        url: video.mediaUrl,
+                        isShort: true,
+                        shouldPlay: index == _currentIndex,
                       ),
-                      const SizedBox(height: 22),
-                      _railAction(short.liked ? Icons.favorite : Icons.favorite_border, _formatViews(short.likes), short.liked ? kAccent : Colors.white),
-                      _railAction(Icons.mode_comment_outlined, _formatViews(short.comments), Colors.white, onTap: () => widget.onCommentTap(short)),
-                      _railAction(Icons.ios_share, 'Share', Colors.white),
-                      _railAction(short.saved ? Icons.bookmark : Icons.bookmark_border, 'Save', Colors.white),
-                    ],
-                  ),
-                ),
-                Positioned(
-                  left: 16,
-                  right: 88,
-                  bottom: 118,
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(short.creator, style: const TextStyle(fontWeight: FontWeight.w900)),
-                      const SizedBox(height: 10),
-                      Text(short.description, maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(height: 1.4)),
-                    ],
-                  ),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-  }
+                      
+                      // Bottom Info
+                      Positioned(
+                        bottom: 80,
+                        left: 16,
+                        right: 80,
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                CreatorAvatar(
+                                  name: video.creator,
+                                  avatarUrl: video.creatorAvatar,
+                                  verified: video.creatorVerified,
+                                  radius: 18,
+                                ),
+                                const SizedBox(width: 8),
+                                Text(
+                                  video.creator,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 16,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                  decoration: BoxDecoration(
+                                    border: Border.all(color: Colors.white),
+                                    borderRadius: BorderRadius.circular(4),
+                                  ),
+                                  child: const Text('Subscribe', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Text(
+                              video.title,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: Colors.white, fontSize: 14),
+                            ),
+                          ],
+                        ),
+                      ),
 
-  Widget _railAction(IconData icon, String label, Color color, {VoidCallback? onTap}) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 20),
-      child: GestureDetector(
-        onTap: onTap,
-        child: Column(
-          children: [
-            Icon(icon, color: color, size: 32),
-            const SizedBox(height: 4),
-            Text(label, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w800)),
-          ],
-        ),
+                      // Right Action Bar
+                      Positioned(
+                        bottom: 80,
+                        right: 8,
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.end,
+                          children: [
+                            _buildActionButton(
+                              icon: isLiked ? Icons.favorite : Icons.favorite_border,
+                              label: likeCount.toString(),
+                              color: isLiked ? kAccent : Colors.white,
+                              onTap: () => _toggleLike(video),
+                            ),
+                            const SizedBox(height: 16),
+                            _buildActionButton(
+                              icon: Icons.chat_bubble_outline,
+                              label: video.comments.toString(),
+                              onTap: () => _showComments(video),
+                            ),
+                            const SizedBox(height: 16),
+                            _buildActionButton(
+                              icon: isSaved ? Icons.bookmark : Icons.bookmark_border,
+                              label: 'Save',
+                              onTap: () => _toggleSave(video),
+                            ),
+                            const SizedBox(height: 16),
+                            _buildActionButton(
+                              icon: Icons.share,
+                              label: 'Share',
+                              onTap: () => _share(video),
+                            ),
+                            const SizedBox(height: 16),
+                            _buildActionButton(
+                              icon: Icons.more_vert,
+                              label: '',
+                              onTap: () {},
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  );
+                },
+              );
+            },
+            loading: () => const Center(child: CircularProgressIndicator()),
+            error: (e, st) => const Center(child: Text('Failed to load shorts', style: TextStyle(color: Colors.white))),
+          ),
+          
+          Positioned(
+            top: 50,
+            left: 0,
+            right: 0,
+            child: const Center(
+              child: Text(
+                'Shorts',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
 
-  String _formatViews(int value) {
-    if (value >= 1000000) return '${(value / 1000000).toStringAsFixed(1)}M';
-    if (value >= 1000) return '${(value / 1000).toStringAsFixed(1)}K';
-    return value.toString();
+  Widget _buildActionButton({required IconData icon, required String label, required VoidCallback onTap, Color color = Colors.white}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Column(
+        children: [
+          Icon(icon, color: color, size: 32),
+          if (label.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Text(label, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+          ]
+        ],
+      ),
+    );
+  }
+}
+
+class _CommentSheet extends ConsumerStatefulWidget {
+  final OfgVideo video;
+  const _CommentSheet({required this.video});
+
+  @override
+  ConsumerState<_CommentSheet> createState() => _CommentSheetState();
+}
+
+class _CommentSheetState extends ConsumerState<_CommentSheet> {
+  final _commentController = TextEditingController();
+  bool _isPosting = false;
+
+  Future<void> _postComment() async {
+    final content = _commentController.text.trim();
+    if (content.isEmpty) return;
+
+    setState(() => _isPosting = true);
+    try {
+      await ref.read(apiClientProvider).post('/videos/${widget.video.id}/comments', {
+        'content': content,
+      });
+      _commentController.clear();
+      FocusScope.of(context).unfocus();
+      ref.invalidate(videoCommentsProvider(widget.video.id));
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to post comment')));
+    } finally {
+      if (mounted) setState(() => _isPosting = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final commentsAsync = ref.watch(videoCommentsProvider(widget.video.id));
+
+    return DraggableScrollableSheet(
+      initialChildSize: 0.6,
+      minChildSize: 0.4,
+      maxChildSize: 0.9,
+      builder: (context, scrollController) {
+        return Container(
+          decoration: const BoxDecoration(
+            color: kPanel,
+            borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+          ),
+          child: Column(
+            children: [
+              Container(
+                margin: const EdgeInsets.only(top: 8, bottom: 16),
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white30,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const Text('Comments', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const Divider(color: kBorder),
+              Expanded(
+                child: commentsAsync.when(
+                  data: (comments) {
+                    if (comments.isEmpty) return const Center(child: Text('No comments yet.'));
+                    return ListView.builder(
+                      controller: scrollController,
+                      itemCount: comments.length,
+                      itemBuilder: (context, index) {
+                        final c = comments[index];
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              CreatorAvatar(name: c.user, radius: 16),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Text(c.userHandle, style: const TextStyle(color: kMuted, fontWeight: FontWeight.bold, fontSize: 13)),
+                                        const SizedBox(width: 8),
+                                        Text(c.when, style: const TextStyle(color: kMuted, fontSize: 12)),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(c.content, style: const TextStyle(fontSize: 14)),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    );
+                  },
+                  loading: () => const Center(child: CircularProgressIndicator()),
+                  error: (_, __) => const Center(child: Text('Error loading comments')),
+                ),
+              ),
+              Container(
+                padding: EdgeInsets.only(
+                  left: 16, right: 16, top: 8,
+                  bottom: MediaQuery.of(context).viewInsets.bottom + 8,
+                ),
+                decoration: const BoxDecoration(
+                  color: kBg,
+                  border: Border(top: BorderSide(color: kBorder)),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _commentController,
+                        decoration: const InputDecoration(
+                          hintText: 'Add a comment...',
+                          border: InputBorder.none,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: _isPosting
+                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(Icons.send, color: kAccent),
+                      onPressed: _postComment,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 }

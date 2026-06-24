@@ -1,153 +1,253 @@
-// lib/presentation/pages/profile_page.dart
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import '../../logic/providers.dart';
 import '../theme/ofg_theme.dart';
+import '../widgets/ofg_ui.dart';
+import '../../api/api_client.dart';
+import '../../logic/providers.dart';
+import 'donation_history_page.dart';
+import 'creator_earnings_page.dart';
 
 class ProfilePage extends ConsumerWidget {
   final VoidCallback onSettingsTap;
   final VoidCallback onCreatorTap;
   final VoidCallback onPremiumTap;
+  final VoidCallback onNotificationTap;
 
   const ProfilePage({
     super.key,
     required this.onSettingsTap,
     required this.onCreatorTap,
     required this.onPremiumTap,
+    required this.onNotificationTap,
   });
+
+  Future<void> _logout(BuildContext context, WidgetRef ref) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Log Out'),
+        content: const Text('Are you sure you want to log out?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel', style: TextStyle(color: Colors.white)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Log Out', style: TextStyle(color: kAccent)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      try {
+        await ref.read(apiClientProvider).delete('/auth/logout');
+      } catch (_) {}
+      await OfgStorage.clear();
+      ref.read(apiClientProvider).token = null;
+      ref.read(authStateProvider.notifier).state = null;
+    }
+  }
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    // Read the real user from Riverpod state
     final user = ref.watch(authStateProvider);
+    final statsAsync = ref.watch(creatorStatsProvider);
 
-    return SafeArea(
-      bottom: false,
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 18, 20, 112),
-        children: [
-          Align(
-            alignment: Alignment.centerRight,
-            child: IconButton(
-              onPressed: onSettingsTap,
-              icon: const Icon(Icons.settings_outlined),
-            ),
+    if (user == null) return const SizedBox();
+
+    return Scaffold(
+      backgroundColor: kBg,
+      appBar: AppBar(
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.edit_outlined),
+            onPressed: () {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Edit profile coming soon')));
+            },
           ),
-          Center(
-            child: Column(
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: onSettingsTap,
+          ),
+        ],
+      ),
+      body: SingleChildScrollView(
+        child: Column(
+          children: [
+            const SizedBox(height: 16),
+            Center(
+              child: CreatorAvatar(
+                name: user.name,
+                avatarUrl: user.avatarUrl,
+                verified: user.isVerified,
+                radius: 48,
+              ),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                const CircleAvatar(
-                  radius: 44,
-                  backgroundColor: kPanel2,
-                  child: Icon(Icons.person, color: Colors.white70, size: 42),
-                ),
-                const SizedBox(height: 14),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Text(
-                      user?.name ?? 'Guest Viewer',
-                      style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w900),
-                    ),
-                    const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(6)),
-                      child: Text(
-                        (user?.subscription ?? 'FREE').toUpperCase(),
-                        style: const TextStyle(color: Colors.black, fontSize: 10, fontWeight: FontWeight.w900),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text(user?.handle ?? '@guest', style: const TextStyle(color: kMuted)),
-                const SizedBox(height: 18),
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    _stat('128', 'Watching'),
-                    _stat('42', 'Playlists'),
-                    _stat('1.2M', 'Following'),
-                  ],
+                Text(
+                  user.name,
+                  style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
                 ),
               ],
             ),
-          ),
-          const SizedBox(height: 22),
-          GestureDetector(
-            onTap: onPremiumTap,
-            child: Container(
-              padding: const EdgeInsets.all(18),
+            Text(
+              user.handle,
+              style: const TextStyle(color: kMuted, fontSize: 16),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
               decoration: BoxDecoration(
-                color: const Color(0xFF121212),
-                borderRadius: BorderRadius.circular(18),
-                border: Border.all(color: const Color(0xFF2A2A2A)),
+                color: user.subscription == 'Premium' ? const Color(0xFFD4AF37).withValues(alpha: 0.2) : kPanel2,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: user.subscription == 'Premium' ? const Color(0xFFD4AF37) : kBorder),
               ),
+              child: Text(
+                user.subscription,
+                style: TextStyle(
+                  color: user.subscription == 'Premium' ? const Color(0xFFD4AF37) : Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+            
+            const SizedBox(height: 24),
+            
+            // Stats Row
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24),
+              child: statsAsync.when(
+                data: (stats) => Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: [
+                    _StatColumn(label: 'Uploads', value: stats['videos'].toString()),
+                    _StatColumn(label: 'Views', value: stats['views'].toString()),
+                    _StatColumn(label: 'Followers', value: stats['followers'].toString()),
+                    _StatColumn(label: 'Likes', value: stats['likes'].toString()),
+                  ],
+                ),
+                loading: () => const Center(child: CircularProgressIndicator()),
+                error: (_, __) => const Text('Error loading stats', style: TextStyle(color: kMuted)),
+              ),
+            ),
+            
+            const SizedBox(height: 32),
+            
+            // Cards
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
               child: Row(
                 children: [
-                  const Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text('OFG Premium', style: TextStyle(fontWeight: FontWeight.w900)),
-                        SizedBox(height: 4),
-                        Text('4K - No ads - Downloads', style: TextStyle(color: kMuted, fontSize: 12.5)),
-                      ],
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: onCreatorTap,
+                      child: Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: ofgPanelDecoration(),
+                        child: const Column(
+                          children: [
+                            Icon(Icons.dashboard_outlined, size: 32, color: Colors.white),
+                            SizedBox(height: 8),
+                            Text('Creator Studio', style: TextStyle(fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                      ),
                     ),
                   ),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: kBorder),
-                      borderRadius: BorderRadius.circular(9),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: onPremiumTap,
+                      child: Container(
+                        padding: const EdgeInsets.all(16),
+                        decoration: BoxDecoration(
+                          gradient: const LinearGradient(
+                            colors: [Color(0xFF2A2A2A), Color(0xFF1A1A1A)],
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                          ),
+                          border: Border.all(color: const Color(0xFFD4AF37).withValues(alpha: 0.5)),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Column(
+                          children: [
+                            Icon(Icons.workspace_premium, size: 32, color: Color(0xFFD4AF37)),
+                            SizedBox(height: 8),
+                            Text('OFG Premium', style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFFD4AF37))),
+                          ],
+                        ),
+                      ),
                     ),
-                    child: const Text('Manage', style: TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w900)),
                   ),
                 ],
               ),
             ),
-          ),
-          const SizedBox(height: 16),
-          _profileRow(Icons.dashboard_outlined, 'Creator Studio', onCreatorTap),
-          _profileRow(Icons.star_border, 'Subscription', onPremiumTap),
-          _profileRow(Icons.settings_outlined, 'Settings', onSettingsTap),
-        ],
-      ),
-    );
-  }
-
-  Widget _stat(String value, String label) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 14),
-      child: Column(
-        children: [
-          Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
-          Text(label, style: const TextStyle(color: kMuted, fontSize: 11)),
-        ],
-      ),
-    );
-  }
-
-  Widget _profileRow(IconData icon, String label, VoidCallback onTap) {
-    return InkWell(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 15),
-        decoration: const BoxDecoration(
-          border: Border(bottom: BorderSide(color: Color(0xFF141414))),
-        ),
-        child: Row(
-          children: [
-            Icon(icon, color: Colors.white70, size: 22),
-            const SizedBox(width: 14),
-            Expanded(
-              child: Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700)),
+            
+            const SizedBox(height: 24),
+            
+            // Menus
+            SettingsRow(
+              icon: Icons.dashboard_outlined,
+              label: 'Creator Studio',
+              onTap: onCreatorTap,
             ),
-            const Icon(Icons.chevron_right, color: kMuted2),
+            SettingsRow(
+              icon: Icons.trending_up_outlined,
+              label: 'Earnings',
+              onTap: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const CreatorEarningsPage())),
+            ),
+            SettingsRow(
+              icon: Icons.favorite_outline,
+              label: 'My Donations',
+              onTap: () => Navigator.push(context,
+                  MaterialPageRoute(builder: (_) => const DonationHistoryPage())),
+            ),
+            SettingsRow(
+              icon: Icons.notifications_none,
+              label: 'Notifications',
+              onTap: onNotificationTap,
+            ),
+            SettingsRow(
+              icon: Icons.settings_outlined,
+              label: 'Settings',
+              onTap: onSettingsTap,
+            ),
+            SettingsRow(
+              icon: Icons.logout,
+              label: 'Log Out',
+              iconColor: kAccent,
+              labelColor: kAccent,
+              onTap: () => _logout(context, ref),
+            ),
+            const SizedBox(height: 100),
           ],
         ),
       ),
+    );
+  }
+}
+
+class _StatColumn extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _StatColumn({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 4),
+        Text(label, style: const TextStyle(color: kMuted, fontSize: 12)),
+      ],
     );
   }
 }
