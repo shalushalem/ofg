@@ -191,25 +191,33 @@ class ApiClient {
   }
 
   // -------------------------------------------------------------------------
-  // multipartUpload – PUT raw bytes to a pre-signed URL (e.g. Cloudflare R2)
+  // streamedUpload – Memory-Safe Upload to Pre-signed URL
   // -------------------------------------------------------------------------
 
-  /// Uploads [bytes] directly to [uploadUrl] using HTTP PUT.
-  /// [contentType] should be the MIME type, e.g. 'video/mp4'.
-  Future<void> multipartUpload(
+  Future<void> streamedUpload(
     String uploadUrl,
-    Uint8List bytes,
+    File file,
     String contentType,
   ) async {
     try {
       final uri = Uri.parse(uploadUrl);
-      final request = http.Request('PUT', uri)
+      final length = await file.length();
+      
+      final request = http.StreamedRequest('PUT', uri)
         ..headers['Content-Type'] = contentType
-        ..headers['Content-Length'] = bytes.length.toString()
-        ..bodyBytes = bytes;
+        ..headers['Content-Length'] = length.toString();
 
-      final streamedResponse =
-          await _httpClient.send(request).timeout(const Duration(minutes: 10));
+      // Stream the file chunk by chunk to prevent OOM crashes
+      file.openRead().listen(
+        request.sink.add,
+        onDone: request.sink.close,
+        onError: request.sink.addError,
+      );
+
+      // Increased timeout to 60 minutes for large videos
+      final streamedResponse = await _httpClient
+          .send(request)
+          .timeout(const Duration(minutes: 60));
 
       if (streamedResponse.statusCode < 200 ||
           streamedResponse.statusCode >= 300) {
@@ -222,7 +230,7 @@ class ApiClient {
     } on SocketException catch (e) {
       throw ApiException('Network error during upload: ${e.message}');
     } on TimeoutException {
-      throw const ApiException('Upload timed out.');
+      throw const ApiException('Upload timed out. Check your connection.');
     }
   }
 
@@ -354,10 +362,11 @@ class ApiClient {
 
   // Upload
   Future<Map<String, dynamic>> initUpload(
-      {required String filename, required String contentType}) async {
+      {required String filename, required String contentType, String type = 'video'}) async {
     final res = await post('/upload/init', {
       'filename': filename,
       'contentType': contentType,
+      'type': type,
     });
     return res as Map<String, dynamic>;
   }
@@ -542,25 +551,19 @@ class ApiClient {
   }
 }
 
-
 // ---------------------------------------------------------------------------
 // findLocalServer – scans 192.168.x.x:8787 for a running OFG server
 // ---------------------------------------------------------------------------
 
-/// Scans the local network subnet for a running OFG API server on [port].
-/// Returns the first reachable base URL, or null if none found.
-/// [subnetPrefix] defaults to '192.168.1' – change based on network.
 Future<String?> findLocalServer({
   String subnetPrefix = '192.168.1',
   int port = 8787,
   Duration timeout = const Duration(milliseconds: 400),
 }) async {
-  // Try a few common host ranges in parallel
   final candidates = [
     for (int i = 1; i <= 254; i++) '$subnetPrefix.$i',
   ];
 
-  // Batch into groups of 30 to avoid socket exhaustion
   const batchSize = 30;
   for (int b = 0; b < candidates.length; b += batchSize) {
     final batch = candidates.skip(b).take(batchSize).toList();
@@ -602,8 +605,6 @@ class OfgStorage {
     ),
   );
 
-  // ---- Token (flutter_secure_storage) ------
-
   static Future<void> saveToken(String token) async {
     await _secureStorage.write(key: _tokenKey, value: token);
   }
@@ -616,8 +617,6 @@ class OfgStorage {
     await _secureStorage.delete(key: _tokenKey);
   }
 
-  // ---- Base URL (SharedPreferences) ------
-
   static Future<void> saveBaseUrl(String url) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_baseUrlKey, url);
@@ -627,8 +626,6 @@ class OfgStorage {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString(_baseUrlKey);
   }
-
-  // ---- User cache (SharedPreferences as JSON) ------
 
   static Future<void> saveUser(OfgUser user) async {
     final prefs = await SharedPreferences.getInstance();
@@ -647,12 +644,9 @@ class OfgStorage {
     }
   }
 
-  // ---- Clear everything ------
-
   static Future<void> clear() async {
     await clearToken();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_userKey);
-    // Deliberately keep baseUrl so the user doesn't have to re-enter it
   }
 }

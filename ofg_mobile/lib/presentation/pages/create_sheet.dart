@@ -1,9 +1,10 @@
+// lib/presentation/pages/create_sheet.dart
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:http/http.dart' as http;
+
 import '../theme/ofg_theme.dart';
 import '../widgets/ofg_ui.dart';
 import '../../api/api_client.dart';
@@ -70,30 +71,6 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
     }
   }
 
-  /// Stream a file directly to a pre-signed PUT URL — avoids loading into RAM.
-  Future<void> _streamUpload(String uploadUrl, File file, String contentType) async {
-    final fileLength = await file.length();
-    final request = http.StreamedRequest('PUT', Uri.parse(uploadUrl));
-    request.headers['Content-Type'] = contentType;
-    request.headers['Content-Length'] = fileLength.toString();
-
-    // Pipe file stream into the request body — memory-safe for large videos
-    file.openRead().pipe(request.sink);
-
-    final httpClient = http.Client();
-    try {
-      final response = await httpClient
-          .send(request)
-          .timeout(const Duration(minutes: 15));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        final body = await response.stream.bytesToString();
-        throw Exception('R2 upload rejected (${response.statusCode}): $body');
-      }
-    } finally {
-      httpClient.close();
-    }
-  }
-
   Future<void> _pickVideo() async {
     if (_picking) return;
     setState(() => _picking = true);
@@ -136,46 +113,48 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
       final videoFileName = videoPath.split('/').last;
 
       // 2. Get presigned upload URL from our backend
-      final videoInit = await api.post('/upload/init', {
-        'filename': videoFileName,
-        'contentType': videoMime,
-        'type': _isShort ? 'short' : 'video',
-      });
+      final videoInit = await api.initUpload(
+        filename: videoFileName,
+        contentType: videoMime,
+        type: _isShort ? 'short' : 'video',
+      );
       final videoUploadUrl = videoInit['uploadUrl'] as String;
       final videoMediaUrl  = videoInit['mediaUrl']  as String;
 
       setState(() => _progress = 0.1);
 
-      // 3. STREAM video directly to R2 (never loads full file into RAM)
-      await _streamUpload(videoUploadUrl, _videoFile!, videoMime);
+      // 3. STREAM video directly to R2 using the API Client
+      await api.streamedUpload(videoUploadUrl, _videoFile!, videoMime);
 
       setState(() => _progress = 0.7);
 
       // 4. Thumbnail upload (optional)
       String thumbnailUrl = '';
       if (_thumbnailFile != null) {
-        final thumbInit = await api.post('/upload/init', {
-          'filename': _thumbnailFile!.path.split('/').last,
-          'contentType': 'image/jpeg',
-          'type': 'thumbnail',
-        });
+        final thumbInit = await api.initUpload(
+          filename: _thumbnailFile!.path.split('/').last,
+          contentType: 'image/jpeg',
+          type: 'thumbnail',
+        );
         thumbnailUrl = thumbInit['mediaUrl'] as String;
-        await _streamUpload(
+        
+        // STREAM thumbnail safely
+        await api.streamedUpload(
             thumbInit['uploadUrl'] as String, _thumbnailFile!, 'image/jpeg');
       }
 
       setState(() => _progress = 0.85);
 
       // 5. Save video metadata to the backend database
-      await api.post('/upload', {
-        'title':        _titleController.text.trim(),
-        'description':  _descController.text.trim(),
-        'category':     _category,
-        'mediaUrl':     videoMediaUrl,
-        'thumbnailUrl': thumbnailUrl,
-        'duration':     '0:00',
-        'isShort':      _isShort,
-      });
+      await api.submitUpload(
+        title:        _titleController.text.trim(),
+        description:  _descController.text.trim(),
+        category:     _category,
+        mediaUrl:     videoMediaUrl,
+        thumbnailUrl: thumbnailUrl,
+        duration:     '0:00',
+        isShort:      _isShort,
+      );
 
       setState(() => _progress = 1.0);
       ref.invalidate(feedProvider);
