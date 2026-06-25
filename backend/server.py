@@ -320,7 +320,7 @@ def _seed_config(conn: DBWrapper) -> None:
         "feed_exploration": 2.0
     }
     for k, v in defaults.items():
-        conn.execute("INSERT OR IGNORE INTO app_config (key, value) VALUES (?, ?)", (k, v))
+        conn.execute("INSERT INTO app_config (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", (k, v))
     conn.commit()
 
 
@@ -1492,7 +1492,7 @@ class Handler(BaseHTTPRequestHandler):
         token = gen_token()
         now = utcnow()
         db.execute(
-            "INSERT OR REPLACE INTO sessions (token, user_id, created_at) VALUES (?,?,?)",
+            "INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?) ON CONFLICT (token) DO UPDATE SET user_id=EXCLUDED.user_id, created_at=EXCLUDED.created_at",
             (token, user["id"], now),
         )
         db.commit()
@@ -2165,7 +2165,7 @@ class Handler(BaseHTTPRequestHandler):
 
         uid = user["id"]
         db.execute(
-            "INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?,?,?)",
+            "INSERT INTO settings (user_id, key, value) VALUES (?,?,?) ON CONFLICT (user_id, key) DO UPDATE SET value=EXCLUDED.value",
             (uid, key, str(value)),
         )
         db.commit()
@@ -2310,10 +2310,10 @@ class Handler(BaseHTTPRequestHandler):
     def _ensure_wallet(self, db: DBWrapper, creator_id: str):
         """Create a wallet row for creator if one doesn't exist."""
         db.execute(
-            """INSERT OR IGNORE INTO creator_wallets
+            """INSERT INTO creator_wallets
                (creator_id, wallet_balance, lifetime_donations, lifetime_platform_fees,
                 total_supporters, monthly_earnings, pending_payout, updated_at)
-               VALUES (?,0,0,0,0,0,0,?)""",
+               VALUES (?, 0, 0, 0, 0, 0, 0, ?) ON CONFLICT (creator_id) DO NOTHING""",
             (creator_id, utcnow()),
         )
 
