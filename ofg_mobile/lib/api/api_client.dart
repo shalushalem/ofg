@@ -615,33 +615,9 @@ Future<String?> findLocalServer({
   int port = 8787,
   Duration timeout = const Duration(milliseconds: 400),
 }) async {
-  final candidates = [
-    for (int i = 1; i <= 254; i++) '$subnetPrefix.$i',
-  ];
-
-  const batchSize = 30;
-  for (int b = 0; b < candidates.length; b += batchSize) {
-    final batch = candidates.skip(b).take(batchSize).toList();
-    final futures = batch.map((host) => _probeHost(host, port, timeout));
-    final results = await Future.wait(futures, eagerError: false);
-    for (int i = 0; i < results.length; i++) {
-      if (results[i] == true) {
-        return 'http://${batch[i]}:$port';
-      }
-    }
-  }
+  // Disabled due to iOS/Android local network privacy dialogs.
+  // Requires manual configuration for development.
   return null;
-}
-
-Future<bool> _probeHost(String host, int port, Duration timeout) async {
-  try {
-    final socket =
-        await Socket.connect(host, port, timeout: timeout);
-    socket.destroy();
-    return true;
-  } catch (_) {
-    return false;
-  }
 }
 
 // ---------------------------------------------------------------------------

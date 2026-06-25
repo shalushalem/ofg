@@ -70,9 +70,6 @@ DB_PATH            = os.environ.get("DB_PATH", "ofg_connects.db")
 # ---------------------------------------------------------------------------
 
 DDL = """
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -265,7 +262,11 @@ class DBWrapper:
         self.conn = conn
 
     def execute(self, sql: str, params: tuple | list = ()):
-        sql_pg = sql.replace("?", "%s")
+        # Safely replace ? with %s by ignoring anything inside single quotes
+        parts = sql.split("'")
+        for i in range(0, len(parts), 2):
+            parts[i] = parts[i].replace("?", "%s")
+        sql_pg = "'".join(parts)
         cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
             cur.execute(sql_pg, params)
@@ -298,8 +299,8 @@ def init_db() -> None:
             if stmt:
                 try:
                     conn.execute(stmt)
-                except psycopg2.Error:
-                    pass
+                except psycopg2.Error as e:
+                    print(f"[OFG WARNING] Schema init error on stmt '{stmt[:50]}...': {e}")
         conn.commit()
         _migrate_db(conn)
         _seed_config(conn)
@@ -466,14 +467,61 @@ def _seed_users(conn: DBWrapper) -> None:
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 def new_id() -> str:
     return secrets.token_urlsafe(16)
-
 
 def gen_token() -> str:
     return secrets.token_urlsafe(32)
 
+def r2_public_url(key: str, pub_url: str, bucket: str) -> str:
+    return f"{pub_url.rstrip('/')}/{key}"
+
+def _r2_presign_put(key: str, content_type: str, bucket: str) -> str:
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+    return s3_client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": key, "ContentType": content_type},
+        ExpiresIn=3600,
+    )
+
+def _log_daily_stat(db, vid_id: str, stat_col: str):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    db.execute(
+        f"""INSERT INTO video_daily_stats (video_id, stat_date, {stat_col}) 
+            VALUES (?, ?, 1) 
+            ON CONFLICT(video_id, stat_date) 
+            DO UPDATE SET {stat_col} = video_daily_stats.{stat_col} + 1""", 
+        (vid_id, today)
+    )
+
+def _update_recent_views(db, vid_id: str):
+    db.execute("UPDATE videos SET recent_views=recent_views+1, recent_views_updated=? WHERE id=?", (utcnow(), vid_id))
+
+class LimitedReader:
+    def __init__(self, stream, limit: int):
+        self.stream = stream
+        self.limit = limit
+        self.read_so_far = 0
+
+    def read(self, size=-1):
+        if self.read_so_far >= self.limit:
+            return b""
+        if size < 0:
+            size = self.limit - self.read_so_far
+        else:
+            size = min(size, self.limit - self.read_so_far)
+        chunk = self.stream.read(size)
+        if not chunk:
+            return b""
+        self.read_so_far += len(chunk)
+        return chunk
 
 def make_handle(name: str) -> str:
     base = re.sub(r"[^a-z0-9]", "", name.lower().replace(" ", ""))[:15]
@@ -894,10 +942,10 @@ def _build_feed(
         creator_count[cid] = cc + 1
         paged.append((score, row, brk))
 
-    # Resort after diversity penalty for just this page
-    # Not perfect globally but works for MVP paging
-    paged.sort(key=lambda x: x[0], reverse=True)
-    paged = paged[start: start + limit]
+    # Slice the page first, then re-sort ONLY the small slice for efficiency
+    page_slice = paged[start : start + limit]
+    page_slice.sort(key=lambda x: x[0], reverse=True)
+    paged = page_slice
 
     # ---- 6. Build result items ----
     items = []
@@ -2042,8 +2090,8 @@ class Handler(BaseHTTPRequestHandler):
             self._error("File too large (max 2 GB)", 413)
             return
 
-        # Read the raw bytes streamed from the phone
-        data = self.rfile.read(content_length)
+        # Stream the raw bytes directly to prevent OOM
+        stream_reader = LimitedReader(self.rfile, content_length)
 
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
 
@@ -2068,11 +2116,11 @@ class Handler(BaseHTTPRequestHandler):
                 config=Config(signature_version="s3v4"),
                 region_name="auto",
             )
-            s3_client.put_object(
+            s3_client.upload_fileobj(
+                Fileobj=stream_reader,
                 Bucket=bucket,
                 Key=key,
-                Body=data,
-                ContentType=content_type,
+                ExtraArgs={"ContentType": content_type},
             )
         except Exception as exc:
             print(f"[OFG ERROR] Proxy upload to R2 failed: {exc}")

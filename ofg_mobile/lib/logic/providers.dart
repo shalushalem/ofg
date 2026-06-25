@@ -137,7 +137,10 @@ final creatorStatsProvider =
     () async {
       final api = ref.read(apiClientProvider);
       final payload = await api.getCreatorStats();
-      return Map<String, dynamic>.from(payload);
+      final map = Map<String, dynamic>.from(payload);
+      map['totalWatchTime'] = (map['totalWatchTime'] as num?)?.toDouble() ?? 0.0;
+      map['avgCompletionRate'] = (map['avgCompletionRate'] as num?)?.toDouble() ?? 0.0;
+      return map;
     },
     fallback: {'views': 0, 'videos': 0, 'likes': 0, 'followers': 0, 'following': 0,
                'totalWatchTime': 0.0, 'avgCompletionRate': 0.0, 'topCategory': '—'},
