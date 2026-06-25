@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:video_player/video_player.dart';
 
 import '../theme/ofg_theme.dart';
 import '../widgets/ofg_ui.dart';
@@ -28,6 +29,7 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
   File? _thumbnailFile;
   File? _videoFile;
   int _videoSize = 0;
+  String _videoDuration = '0:00';
 
   bool _uploading = false;
   bool _picking = false;
@@ -116,7 +118,20 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
       if (result != null && result.files.single.path != null && mounted) {
         final file = File(result.files.single.path!);
         final size = await file.length();
-        setState(() { _videoFile = file; _videoSize = size; });
+        
+        final controller = VideoPlayerController.file(file);
+        await controller.initialize();
+        final duration = controller.value.duration;
+        final mins = duration.inMinutes;
+        final secs = duration.inSeconds % 60;
+        final durationStr = '$mins:${secs.toString().padLeft(2, '0')}';
+        await controller.dispose();
+
+        setState(() { 
+          _videoFile = file; 
+          _videoSize = size; 
+          _videoDuration = durationStr;
+        });
       }
     } catch (_) {
     } finally {
@@ -188,7 +203,7 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
         'category':     _category,
         'mediaUrl':     videoMediaUrl,
         'thumbnailUrl': thumbnailUrl,
-        'duration':     '0:00',
+        'duration':     _videoDuration,
         'isShort':      _isShort,
       });
 
