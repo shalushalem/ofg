@@ -13,6 +13,7 @@ import re
 import secrets
 import psycopg2
 import psycopg2.extras
+from psycopg2 import pool
 import urllib.parse
 import urllib.request
 import base64
@@ -203,6 +204,7 @@ CREATE TABLE IF NOT EXISTS video_skips (
 
 CREATE INDEX IF NOT EXISTS idx_videos_creator ON videos(creator_id);
 CREATE INDEX IF NOT EXISTS idx_videos_category ON videos(category);
+CREATE INDEX IF NOT EXISTS idx_videos_feed ON videos(is_removed, created_at DESC, views DESC);
 CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id);
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);
 CREATE INDEX IF NOT EXISTS idx_comments_video ON comments(video_id);
@@ -258,8 +260,9 @@ CREATE INDEX IF NOT EXISTS idx_payouts_status ON payouts(status);
 
 
 class DBWrapper:
-    def __init__(self, conn):
+    def __init__(self, conn, pool_ref=None):
         self.conn = conn
+        self.pool = pool_ref
 
     def execute(self, sql: str, params: tuple | list = ()):
         # Safely replace ? with %s by ignoring anything inside single quotes
@@ -280,15 +283,25 @@ class DBWrapper:
         self.conn.commit()
 
     def close(self):
-        self.conn.close()
+        if self.pool and self.conn:
+            self.pool.putconn(self.conn)
+            self.conn = None
+        elif self.conn:
+            self.conn.close()
+
+db_pool = None
 
 def get_db() -> DBWrapper:
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise Exception("DATABASE_URL environment variable is missing")
-    conn = psycopg2.connect(db_url)
+    global db_pool
+    if db_pool is None:
+        db_url = os.environ.get("DATABASE_URL")
+        if not db_url:
+            raise Exception("DATABASE_URL environment variable is missing")
+        db_pool = pool.ThreadedConnectionPool(1, 20, db_url)
+    
+    conn = db_pool.getconn()
     conn.autocommit = False
-    return DBWrapper(conn)
+    return DBWrapper(conn, db_pool)
 
 
 def init_db() -> None:
@@ -985,7 +998,7 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Secret")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Secret, X-Upload-Type, X-Filename")
 
     def _json(self, data: dict, status: int = 200):
         body = json.dumps(data, default=str).encode("utf-8")
@@ -1041,7 +1054,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _require_admin(self, db: DBWrapper) -> bool:
         secret = self.headers.get("X-Admin-Secret", "")
-        if secret == ADMIN_SECRET:
+        if hmac.compare_digest(secret, ADMIN_SECRET):
             return True
         user = self._user(db)
         if user and user["is_admin"]:
@@ -1063,7 +1076,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._route_get(db)
         except Exception as exc:
-            print(f"[OFG ERROR] GET {self.path}: {exc}")
+            print(f"[OFG ERROR] GET {self.path.split('?')[0]}: {exc}")
             self._error("Internal server error", 500)
         finally:
             db.close()
@@ -1326,7 +1339,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._route_post(db)
         except Exception as exc:
-            print(f"[OFG ERROR] POST {self.path}: {exc}")
+            print(f"[OFG ERROR] POST {self.path.split('?')[0]}: {exc}")
             self._error("Internal server error", 500)
         finally:
             db.close()
@@ -1508,7 +1521,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._error("Not found", 404)
         except Exception as exc:
-            print(f"[OFG ERROR] PUT {self.path}: {exc}")
+            print(f"[OFG ERROR] PUT {self.path.split('?')[0]}: {exc}")
             self._error("Internal server error", 500)
         finally:
             db.close()
@@ -1534,7 +1547,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._error("Not found", 404)
         except Exception as exc:
-            print(f"[OFG ERROR] DELETE {self.path}: {exc}")
+            print(f"[OFG ERROR] DELETE {self.path.split('?')[0]}: {exc}")
             self._error("Internal server error", 500)
         finally:
             db.close()
@@ -1714,7 +1727,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if existing:
             db.execute("DELETE FROM likes WHERE user_id=? AND video_id=?", (uid, vid_id))
-            db.execute("UPDATE videos SET like_count=MAX(0, like_count-1) WHERE id=?", (vid_id,))
+            db.execute("UPDATE videos SET like_count=GREATEST(0, like_count-1) WHERE id=?", (vid_id,))
             liked = False
         else:
             now = utcnow()
@@ -1758,7 +1771,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if existing:
             db.execute("DELETE FROM saves WHERE user_id=? AND video_id=?", (uid, vid_id))
-            db.execute("UPDATE videos SET save_count=MAX(0, save_count-1) WHERE id=?", (vid_id,))
+            db.execute("UPDATE videos SET save_count=GREATEST(0, save_count-1) WHERE id=?", (vid_id,))
             saved = False
         else:
             now = utcnow()
@@ -1945,10 +1958,10 @@ class Handler(BaseHTTPRequestHandler):
                 "DELETE FROM follows WHERE follower_id=? AND creator_id=?", (uid, creator_id)
             )
             db.execute(
-                "UPDATE users SET follower_count=MAX(0, follower_count-1) WHERE id=?", (creator_id,)
+                "UPDATE users SET follower_count=GREATEST(0, follower_count-1) WHERE id=?", (creator_id,)
             )
             db.execute(
-                "UPDATE users SET following_count=MAX(0, following_count-1) WHERE id=?", (uid,)
+                "UPDATE users SET following_count=GREATEST(0, following_count-1) WHERE id=?", (uid,)
             )
             following = False
         else:
