@@ -14,7 +14,6 @@ import secrets
 import sqlite3
 import urllib.parse
 import urllib.request
-import hmac
 import base64
 import datetime
 from datetime import datetime, timezone, timedelta
@@ -88,6 +87,7 @@ CREATE TABLE IF NOT EXISTS users (
     is_banned INTEGER DEFAULT 0,
     follower_count INTEGER DEFAULT 0,
     following_count INTEGER DEFAULT 0,
+    dob TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
 
@@ -286,6 +286,7 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     """Safely add new algorithm columns to existing databases."""
     migrations = [
         "ALTER TABLE videos ADD COLUMN impressions INTEGER DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN dob TEXT DEFAULT ''",
         "ALTER TABLE videos ADD COLUMN avg_completion_rate REAL DEFAULT 0",
         "ALTER TABLE videos ADD COLUMN recent_views INTEGER DEFAULT 0",
         "ALTER TABLE videos ADD COLUMN recent_views_updated TEXT DEFAULT ''",
@@ -574,7 +575,7 @@ def video_to_dict(row, liked=False, saved=False, following=False) -> dict:
         "isShort": bool(row["is_short"]),
         "isLive": bool(row["is_live"]),
         "isFeatured": bool(row["is_featured"] if row["is_featured"] is not None else 0),
-        "progress": row["progress"] if row["progress"] is not None else 0,
+        "progress": 0,  # callers (feed/video_get) override from history
         "liked": liked,
         "saved": saved,
         "following": following,
@@ -597,6 +598,7 @@ def user_to_dict(row) -> dict:
         "subscription": row["subscription"] or "Free",
         "isVerified": bool(row["is_verified"]),
         "isAdmin": bool(row["is_admin"]),
+        "dob": row.get("dob") or "",
     }
 
 
@@ -664,10 +666,11 @@ def _r2_presign_put(key: str, content_type: str, expires: int = 3600,
             region_name='auto'
         )
 
-        params = {'Bucket': target_bucket, 'Key': key}
-        # NOTE: Do NOT include ContentType in params — if we sign it, the client's
-        # Content-Type header must match byte-perfectly or R2 returns 403.
-        # Leaving it unsigned means the client can set any Content-Type freely.
+        params = {
+            'Bucket': target_bucket, 
+            'Key': key,
+            'ContentType': content_type 
+        }
 
         return s3_client.generate_presigned_url(
             ClientMethod='put_object',
@@ -1357,6 +1360,14 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_upload_init(db, user)
             return
 
+        # /upload/proxy  — phone streams file here; server uploads to R2
+        if path == "/upload/proxy":
+            user = self._require_user(db)
+            if not user:
+                return
+            self._handle_upload_proxy(db, user)
+            return
+
         # /upload
         if path == "/upload":
             user = self._require_user(db)
@@ -1513,15 +1524,26 @@ class Handler(BaseHTTPRequestHandler):
         name  = (body.get("name") or "").strip()
         email = (body.get("email") or "").strip().lower()
         password = body.get("password") or ""
+        dob = (body.get("dob") or "").strip()
 
-        if not name or not email or not password:
-            self._error("name, email, and password are required")
+        if not name or not email or not password or not dob:
+            self._error("name, email, password, and date of birth are required")
             return
         if not validate_email(email):
             self._error("Invalid email format")
             return
         if len(password) < 6:
             self._error("Password must be at least 6 characters")
+            return
+            
+        try:
+            dob_date = datetime.strptime(dob, "%Y-%m-%d").date()
+            age = (datetime.now(timezone.utc).date() - dob_date).days / 365.25
+            if age < 13:
+                self._error("You must be at least 13 years old to use this app.")
+                return
+        except ValueError:
+            self._error("Invalid Date of Birth format. Use YYYY-MM-DD")
             return
 
         existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
@@ -1538,9 +1560,9 @@ class Handler(BaseHTTPRequestHandler):
         db.execute(
             """INSERT INTO users (id, name, email, handle, password_hash, salt,
                bio, avatar_url, subscription, is_verified, is_admin, is_banned,
-               follower_count, following_count, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (uid, name, email, handle, phash, salt, "", "", "Free", 0, 0, 0, 0, 0, now),
+               follower_count, following_count, dob, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (uid, name, email, handle, phash, salt, "", "", "Free", 0, 0, 0, 0, 0, dob, now),
         )
 
         token = gen_token()
@@ -1614,13 +1636,19 @@ class Handler(BaseHTTPRequestHandler):
 
         user = self._user(db)
         liked = saved = following = False
+        prog = 0.0
         if user:
             uid = user["id"]
-            liked   = bool(db.execute("SELECT 1 FROM likes WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
-            saved   = bool(db.execute("SELECT 1 FROM saves WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
+            liked     = bool(db.execute("SELECT 1 FROM likes WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
+            saved     = bool(db.execute("SELECT 1 FROM saves WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
             following = bool(db.execute("SELECT 1 FROM follows WHERE follower_id=? AND creator_id=?", (uid, row["creator_id"])).fetchone())
+            hr = db.execute("SELECT progress FROM history WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone()
+            if hr:
+                prog = float(hr["progress"] or 0)
 
-        self._json({"video": video_to_dict(row, liked=liked, saved=saved, following=following)})
+        d = video_to_dict(row, liked=liked, saved=saved, following=following)
+        d["progress"] = prog
+        self._json({"video": d})
 
     def _handle_shorts(self, db: sqlite3.Connection, qs: dict):
         page  = int(qs.get("page", 0))
@@ -2012,6 +2040,64 @@ class Handler(BaseHTTPRequestHandler):
         media_url  = r2_public_url(key, pub_url=pub_url, bucket=bucket)
 
         self._json({"uploadUrl": upload_url, "mediaUrl": media_url, "key": key})
+
+    def _handle_upload_proxy(self, db: sqlite3.Connection, user):
+        """
+        Phone streams raw file bytes here.
+        Server uploads to R2 via boto3 (server-to-R2 works; phone-to-R2 fails on some ISPs).
+        Returns { mediaUrl, key }.
+        """
+        content_type  = self.headers.get("Content-Type", "application/octet-stream")
+        content_length = int(self.headers.get("Content-Length", 0) or 0)
+        upload_type   = (self.headers.get("X-Upload-Type") or "video").strip().lower()
+        filename      = (self.headers.get("X-Filename") or "upload.bin").strip()
+
+        if content_length <= 0:
+            self._error("Content-Length required", 400)
+            return
+        if content_length > 2 * 1024 * 1024 * 1024:  # 2 GB hard limit
+            self._error("File too large (max 2 GB)", 413)
+            return
+
+        # Read the raw bytes streamed from the phone
+        data = self.rfile.read(content_length)
+
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+
+        # Route to correct bucket
+        if upload_type == "thumbnail" or content_type.startswith("image/"):
+            bucket, pub_url = R2_THUMBNAILS_BUCKET, R2_THUMBNAILS_PUBLIC_URL
+            key = f"thumbnails/{new_id()}.{ext}"
+        elif upload_type == "short":
+            bucket, pub_url = R2_SHORTS_BUCKET, R2_SHORTS_PUBLIC_URL
+            key = f"shorts/{new_id()}.{ext}"
+        else:
+            bucket, pub_url = R2_BUCKET_NAME, R2_PUBLIC_URL
+            key = f"videos/{new_id()}.{ext}"
+
+        # Upload from server to R2 (this always works — server can reach R2)
+        try:
+            s3_client = boto3.client(
+                "s3",
+                endpoint_url=R2_ENDPOINT,
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                config=Config(signature_version="s3v4"),
+                region_name="auto",
+            )
+            s3_client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
+        except Exception as exc:
+            print(f"[OFG ERROR] Proxy upload to R2 failed: {exc}")
+            self._error(f"R2 upload failed: {exc}", 500)
+            return
+
+        media_url = r2_public_url(key, pub_url=pub_url, bucket=bucket)
+        self._json({"mediaUrl": media_url, "key": key})
 
     def _handle_upload(self, db: sqlite3.Connection, user):
         body         = self._body()
