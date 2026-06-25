@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS videos (
     like_count INTEGER DEFAULT 0,
     comment_count INTEGER DEFAULT 0,
     share_count INTEGER DEFAULT 0,
+    save_count INTEGER DEFAULT 0,
     watch_time_total REAL DEFAULT 0,
     thumbnail_url TEXT DEFAULT '',
     media_url TEXT DEFAULT '',
@@ -277,9 +278,26 @@ def init_db() -> None:
                     pass
         conn.commit()
         _migrate_db(conn)
+        _seed_config(conn)
         _seed_users(conn)
     finally:
         conn.close()
+
+def _seed_config(conn: sqlite3.Connection) -> None:
+    defaults = {
+        "feed_completion": 25.0,
+        "feed_category": 25.0,
+        "feed_following": 15.0,
+        "feed_likes": 8.0,
+        "feed_shares": 8.0,
+        "feed_saves": 5.0,
+        "feed_freshness": 8.0,
+        "feed_age": 4.0,
+        "feed_exploration": 2.0
+    }
+    for k, v in defaults.items():
+        conn.execute("INSERT OR IGNORE INTO app_config (key, value) VALUES (?, ?)", (k, v))
+    conn.commit()
 
 
 def _migrate_db(conn: sqlite3.Connection) -> None:
@@ -298,6 +316,28 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(user_id, video_id)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_video_skips_user ON video_skips(user_id)",
+        "ALTER TABLE videos ADD COLUMN save_count INTEGER DEFAULT 0",
+        """CREATE TABLE IF NOT EXISTS video_daily_stats (
+            video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
+            stat_date TEXT NOT NULL,
+            views INTEGER DEFAULT 0,
+            likes INTEGER DEFAULT 0,
+            shares INTEGER DEFAULT 0,
+            comments INTEGER DEFAULT 0,
+            saves INTEGER DEFAULT 0,
+            PRIMARY KEY(video_id, stat_date)
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_video_daily_stats_date ON video_daily_stats(stat_date)",
+        """CREATE TABLE IF NOT EXISTS user_blocks (
+            blocker_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            blocked_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(blocker_id, blocked_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS app_config (
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL
+        )""",
         # Donation system tables
         """CREATE TABLE IF NOT EXISTS creator_wallets (
             creator_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -439,8 +479,10 @@ def format_views(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Algorithm v2 — YouTube-inspired multi-signal scoring
+# Algorithm V5 — Production Recommendation Engine
 # ---------------------------------------------------------------------------
+import random
+from datetime import timedelta
 
 def _age_hours(created_at_iso: str) -> float:
     try:
@@ -449,262 +491,32 @@ def _age_hours(created_at_iso: str) -> float:
     except Exception:
         return 9999.0
 
-
-def _recency_score(age_hours: float) -> float:
-    """Smooth decay curve instead of step-function."""
-    if age_hours < 6:    return 20.0
-    if age_hours < 24:   return 16.0
-    if age_hours < 72:   return 11.0
-    if age_hours < 168:  return 7.0
-    if age_hours < 720:  return 3.0
-    if age_hours < 2160: return 1.0
-    return 0.0
-
-
-def _ctr_score(views: int, impressions: int) -> float:
-    """Click-through rate signal — how often people click when shown this video."""
-    if impressions < 10:
-        return 5.0  # Not enough data — neutral prior
-    ctr = min(views / impressions, 1.0)
-    # YouTube target CTR is ~2-10%; we scale to 0-25 pts
-    return min(ctr * 150, 25.0)
-
-
-def _engagement_score(like_count: int, comment_count: int, share_count: int, views: int) -> float:
-    """Weighted engagement rate — shares > comments > likes (cost of action)."""
-    # Likes=1, Comments=3 (intent to discuss), Shares=5 (highest intent)
-    weighted = like_count * 1 + comment_count * 3 + share_count * 5
-    rate = weighted / max(views, 1)
-    return min(rate * 50, 30.0)
-
-
-def _completion_score(avg_completion: float) -> float:
-    """Avg completion rate across ALL users for this video — signals content quality."""
-    # 0-20 pts. A video watched to 80%+ avg is exceptional.
-    return min(avg_completion * 25, 20.0)
-
-
-def _velocity_score(recent_views: int, total_views: int, age_hours: float) -> float:
-    """Trending signal — how fast is this video gaining traction right now?"""
-    if total_views < 1:
-        return 0.0
-    # recent_views = views in last 24h
-    velocity = recent_views / max(total_views, 1)
-    # New videos naturally have high velocity — dampen slightly for very new content
-    dampen = min(age_hours / 12, 1.0) if age_hours < 48 else 1.0
-    return min(velocity * 40 * dampen, 20.0)
-
-
-def score_video(
-    row: dict,
-    *,
-    follow_boost: float = 0.0,
-    watch_penalty: float = 0.0,
-    category_score: float = 0.0,
-    collab_boost: float = 0.0,
-    save_boost: float = 0.0,
-) -> float:
-    """Main scoring function — combines all signals."""
-    views = row.get("views") or 0
-    impressions = row.get("impressions") or views  # fallback if column missing
-    age_h = _age_hours(row.get("created_at", ""))
-    recent_v = row.get("recent_views") or 0
-    avg_comp = row.get("avg_completion_rate") or 0.0
-
-    # Core signals
-    s_ctr         = _ctr_score(views, impressions)                               # max 25
-    s_engagement  = _engagement_score(
-        row.get("like_count") or 0,
-        row.get("comment_count") or 0,
-        row.get("share_count") or 0,
-        views,
-    )                                                                             # max 30
-    s_completion  = _completion_score(avg_comp)                                  # max 20
-    s_velocity    = _velocity_score(recent_v, views, age_h)                     # max 20
-    s_recency     = _recency_score(age_h)                                       # max 20
-
-    # Personalization signals
-    s_follow      = follow_boost      # +15 if user follows creator
-    s_category    = category_score    # 0-20 based on user affinity
-    s_collab      = collab_boost      # 0-10 collaborative filtering boost
-    s_save        = save_boost        # +5 if user saved similar content
-
-    # Penalty / suppression
-    s_watch       = watch_penalty     # -3 to -20 depending on skip depth
-
-    # Featured override
-    s_featured    = 100.0 if (row.get("is_featured") or 0) else 0.0
-
-    return (s_ctr + s_engagement + s_completion + s_velocity + s_recency
-            + s_follow + s_category + s_collab + s_save + s_watch + s_featured)
-
-
-def _update_recent_views(db, vid_id: str) -> None:
-    """Recalculate recent_views (last 24h) for a video. Called on watch event."""
-    threshold = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    count = db.execute(
-        """SELECT COUNT(*) FROM history
-           WHERE video_id=? AND viewed_at > ?""",
-        (vid_id, threshold),
-    ).fetchone()[0]
-    db.execute(
-        "UPDATE videos SET recent_views=?, recent_views_updated=? WHERE id=?",
-        (count, utcnow(), vid_id),
-    )
-
-
-# ---------------------------------------------------------------------------
-# JSON serializers
-# ---------------------------------------------------------------------------
-
-def video_to_dict(row, liked=False, saved=False, following=False) -> dict:
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "description": row["description"] or "",
-        "creator": row["creator_name"],
-        "creatorId": row["creator_id"],
-        "creatorAvatar": row["avatar_url"] if row["avatar_url"] else "",
-        "creatorVerified": bool(row["is_verified"] if row["is_verified"] is not None else 0),
-        "category": row["category"],
-        "duration": row["duration"] or "0:00",
-        "views": row["views"] or 0,
-        "likes": row["like_count"] or 0,
-        "comments": row["comment_count"] or 0,
-        "shares": row["share_count"] or 0,
-        "isShort": bool(row["is_short"]),
-        "isLive": bool(row["is_live"]),
-        "isFeatured": bool(row["is_featured"] if row["is_featured"] is not None else 0),
-        "progress": 0,  # callers (feed/video_get) override from history
-        "liked": liked,
-        "saved": saved,
-        "following": following,
-        "mediaUrl": row["media_url"] or "",
-        "thumbnailUrl": row["thumbnail_url"] or "",
-        "createdAt": row["created_at"],
-        "label": f"{row['category']} {'shorts' if row['is_short'] else 'video'}",
-        "meta": f"{row['creator_name']} • {format_views(row['views'] or 0)} views",
+def _get_weights(db) -> dict:
+    weights = {
+        "completion": 25.0,
+        "category": 25.0,
+        "following": 15.0,
+        "likes": 8.0,
+        "shares": 8.0,
+        "saves": 5.0,
+        "freshness": 8.0,
+        "age": 4.0,
+        "exploration": 2.0,
+        "trending": 8.0,
     }
-
-
-def user_to_dict(row) -> dict:
-    return {
-        "id": row["id"],
-        "name": row["name"],
-        "email": row["email"],
-        "handle": row["handle"],
-        "bio": row["bio"] or "",
-        "avatarUrl": row["avatar_url"] or "",
-        "subscription": row["subscription"] or "Free",
-        "isVerified": bool(row["is_verified"]),
-        "isAdmin": bool(row["is_admin"]),
-        "dob": row.get("dob") or "",
-    }
-
-
-def comment_to_dict(row) -> dict:
-    return {
-        "id": row["id"],
-        "videoId": row["video_id"],
-        "userId": row["user_id"],
-        "userName": row["user_name"],
-        "userHandle": row["user_handle"],
-        "content": row["content"],
-        "likeCount": row["like_count"] or 0,
-        "createdAt": row["created_at"],
-    }
-
-
-def notification_to_dict(row) -> dict:
-    return {
-        "id": row["id"],
-        "userId": row["user_id"],
-        "type": row["type"],
-        "fromUserId": row["from_user_id"] or "",
-        "fromUserName": row["from_user_name"] or "",
-        "videoId": row["video_id"] or "",
-        "message": row["message"],
-        "isRead": bool(row["is_read"]),
-        "createdAt": row["created_at"],
-    }
-
-
-def report_to_dict(row) -> dict:
-    return {
-        "id": row["id"],
-        "reporterId": row["reporter_id"],
-        "type": row["type"],
-        "targetId": row["target_id"],
-        "reason": row["reason"],
-        "status": row["status"],
-        "createdAt": row["created_at"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Cloudflare R2 pre-signed URL (AWS Signature Version 4)
-# ---------------------------------------------------------------------------
-
-def _hmac_sha256(key: bytes, data: str) -> bytes:
-    return hmac.new(key, data.encode("utf-8"), hashlib.sha256).digest()
-
-
-def _r2_presign_put(key: str, content_type: str, expires: int = 3600,
-                    bucket: str = None, public_url: str = None) -> str:
-    """Generate a pre-signed PUT URL for R2 using boto3."""
-    if not R2_ENDPOINT or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
-        return ""
-
-    target_bucket = bucket or R2_BUCKET_NAME
-
     try:
-        s3_client = boto3.client('s3',
-            endpoint_url=R2_ENDPOINT,
-            aws_access_key_id=R2_ACCESS_KEY_ID,
-            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-            config=Config(signature_version='s3v4'),
-            region_name='auto'
-        )
-
-        params = {
-            'Bucket': target_bucket, 
-            'Key': key,
-            'ContentType': content_type 
-        }
-
-        return s3_client.generate_presigned_url(
-            ClientMethod='put_object',
-            Params=params,
-            ExpiresIn=expires
-        )
-    except Exception as e:
-        print(f"[OFG ERROR] Presign URL failed: {e}")
-        return ""
-
-
-def r2_public_url(key: str, pub_url: str = None, bucket: str = None) -> str:
-    base = (pub_url or R2_PUBLIC_URL).rstrip("/")
-    if base:
-        return f"{base}/{key}"
-    target_bucket = bucket or R2_BUCKET_NAME
-    if R2_ENDPOINT:
-        return f"{R2_ENDPOINT.rstrip('/')}/{target_bucket}/{key}"
-    return key
-
+        rows = db.execute("SELECT key, value FROM app_config").fetchall()
+        for r in rows:
+            k = r["key"].replace("feed_", "")
+            if k in weights:
+                weights[k] = float(r["value"])
+    except Exception:
+        pass
+    return weights
 
 # ---------------------------------------------------------------------------
 # Feed query helper
 # ---------------------------------------------------------------------------
-
-VIDEO_SELECT = """
-    SELECT v.*,
-           u.avatar_url,
-           u.is_verified
-    FROM videos v
-    JOIN users u ON u.id = v.creator_id
-    WHERE v.is_removed = 0
-"""
-
 
 def _build_feed(
     db: sqlite3.Connection,
@@ -716,13 +528,11 @@ def _build_feed(
     search_q: str = "",
 ) -> tuple[list[dict], int]:
     """
-    Algorithm v2 — YouTube-inspired multi-signal personalized feed.
-    Signals: CTR, engagement quality, completion rate, velocity/trending,
-             recency, follow boost, category affinity, collaborative filtering,
-             adaptive watch penalty, creator diversity.
+    Algorithm v5 — Multi-signal personalized feed.
     """
+    weights = _get_weights(db)
 
-    # ---- base query — fetch all candidates ----
+    # ---- 1. Generate Candidate Pool ----
     conditions = ["v.is_removed = 0"]
     params: list = []
 
@@ -741,6 +551,7 @@ def _build_feed(
 
     where = " AND ".join(conditions)
 
+    # Performance: Only fetch top 500 recent or high-view videos as candidates
     sql = f"""
         SELECT v.*,
                u.avatar_url,
@@ -748,182 +559,243 @@ def _build_feed(
         FROM videos v
         JOIN users u ON u.id = v.creator_id
         WHERE {where}
+        ORDER BY v.created_at DESC, v.views DESC
+        LIMIT 500
     """
 
     rows = db.execute(sql, params).fetchall()
-
     if not rows:
         return [], 0
-
-    # ---- Track impressions for CTR signal ----
-    # Every video returned in /feed = 1 impression (server-side CTR)
+        
     vid_ids_in_feed = [r["id"] for r in rows]
-    if vid_ids_in_feed:
-        placeholders = ",".join("?" * len(vid_ids_in_feed))
-        db.execute(
-            f"UPDATE videos SET impressions=impressions+1 WHERE id IN ({placeholders})",
-            vid_ids_in_feed,
-        )
-        db.commit()
 
-    # ---- Personalization context ----
+    # ---- 2. Personalization context ----
+    uid = user["id"] if user else None
+    user_age = 0
+    history_count = 0
+
     followed_ids: set[str] = set()
-    watched_completion: dict[str, float] = {}   # video_id -> user's personal completion rate
-    skip_ids: set[str] = set()                   # videos user skipped early
-    top_categories: dict[str, float] = {}        # category -> affinity score
+    blocked_ids: set[str] = set()
+    watched_completion: dict[str, float] = {}
+    skip_ids: set[str] = set()
+    top_categories: dict[str, float] = {}
     liked_ids: set[str] = set()
     saved_ids: set[str] = set()
-    collab_video_ids: set[str] = set()           # collaborative filtering candidates
 
-    if user:
-        uid = user["id"]
+    if uid:
+        # Age
+        dob_str = user.get("dob")
+        if dob_str:
+            try:
+                dob = datetime.strptime(dob_str, "%Y-%m-%d").date()
+                today = datetime.now(timezone.utc).date()
+                user_age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+            except Exception:
+                pass
+
+        # Blocks
+        try:
+            blk = db.execute("SELECT blocked_id FROM user_blocks WHERE blocker_id=?", (uid,)).fetchall()
+            blocked_ids = {r["blocked_id"] for r in blk}
+        except Exception: pass
 
         # Follows
         foll = db.execute("SELECT creator_id FROM follows WHERE follower_id=?", (uid,)).fetchall()
         followed_ids = {r["creator_id"] for r in foll}
 
-        # Watch history with completion rates
-        hist = db.execute(
-            "SELECT video_id, completion_rate FROM history WHERE user_id=?", (uid,)
-        ).fetchall()
+        # Watch history
+        hist = db.execute("SELECT video_id, completion_rate FROM history WHERE user_id=?", (uid,)).fetchall()
+        history_count = len(hist)
         for r in hist:
             watched_completion[r["video_id"]] = float(r["completion_rate"] or 0)
 
         # Skips (completion < 15%)
         try:
-            skip_rows = db.execute(
-                "SELECT video_id FROM video_skips WHERE user_id=?", (uid,)
-            ).fetchall()
+            skip_rows = db.execute("SELECT video_id FROM video_skips WHERE user_id=?", (uid,)).fetchall()
             skip_ids = {r["video_id"] for r in skip_rows}
-        except Exception:
-            pass  # Table may not exist on old DB — safe fallback
+        except Exception: pass
 
-        # Category affinity — weighted by completion + recency
+        # Category affinity
         cat_sql = """
-            SELECT v.category,
-                   SUM(h.completion_rate * CASE
-                       WHEN h.viewed_at > datetime('now', '-7 days') THEN 2.0
-                       WHEN h.viewed_at > datetime('now', '-30 days') THEN 1.0
-                       ELSE 0.5 END) AS weighted_affinity,
-                   COUNT(*) AS cnt
+            SELECT v.category, SUM(h.completion_rate) AS affinity
             FROM history h
             JOIN videos v ON v.id = h.video_id
             WHERE h.user_id = ?
             GROUP BY v.category
-            ORDER BY weighted_affinity DESC
         """
         cat_rows = db.execute(cat_sql, (uid,)).fetchall()
         for cr in cat_rows:
-            top_categories[cr["category"]] = float(cr["weighted_affinity"] or 0)
-
-        # Normalize category affinity to 0-1
+            top_categories[cr["category"]] = float(cr["affinity"] or 0)
         max_affinity = max(top_categories.values(), default=1)
         top_categories = {k: v / max_affinity for k, v in top_categories.items()}
 
         # Likes / Saves
         lk = db.execute("SELECT video_id FROM likes WHERE user_id=?", (uid,)).fetchall()
         liked_ids = {r["video_id"] for r in lk}
-
         sv = db.execute("SELECT video_id FROM saves WHERE user_id=?", (uid,)).fetchall()
         saved_ids = {r["video_id"] for r in sv}
 
-        # ---- Collaborative Filtering (lightweight co-watch) ----
-        # Find users who watched the same top-3 videos as this user
-        # Then recommend what they also watched (but this user hasn't seen)
-        top_watched = list(watched_completion.keys())[:3]
-        if top_watched:
-            placeholders = ",".join("?" * len(top_watched))
-            similar_users = db.execute(
-                f"""SELECT DISTINCT h2.user_id FROM history h2
-                    WHERE h2.video_id IN ({placeholders})
-                    AND h2.user_id != ?
-                    AND h2.completion_rate > 0.5
-                    LIMIT 20""",
-                top_watched + [uid],
-            ).fetchall()
-            similar_uids = [r["user_id"] for r in similar_users]
-            if similar_uids:
-                s_ph = ",".join("?" * len(similar_uids))
-                collab_rows = db.execute(
-                    f"""SELECT DISTINCT h.video_id FROM history h
-                        WHERE h.user_id IN ({s_ph})
-                        AND h.video_id NOT IN ({placeholders})
-                        AND h.completion_rate > 0.6""",
-                    similar_uids + top_watched,
-                ).fetchall()
-                collab_video_ids = {r["video_id"] for r in collab_rows}
-
-    # ---- Score each video ----
-    scored: list[tuple[float, sqlite3.Row]] = []
-
-    for row in rows:
-        vid_id  = row["id"]
-        vid_cat = row["category"]
-        creator_id = row["creator_id"]
-
-        # --- Personalization signals ---
-        follow_boost = 15.0 if creator_id in followed_ids else 0.0
-
-        # Adaptive watch penalty based on how much user skipped
-        if vid_id in skip_ids:
-            watch_penalty = -20.0  # User actively skipped early — strong suppress
-        elif vid_id in watched_completion:
-            cr = watched_completion[vid_id]
-            if cr >= 0.85:
-                watch_penalty = -2.0   # Watched nearly all — mild penalty (may rewatch)
-            elif cr >= 0.5:
-                watch_penalty = -6.0   # Watched half
-            elif cr >= 0.2:
-                watch_penalty = -12.0  # Watched a little
-            else:
-                watch_penalty = -18.0  # Barely watched — suppress heavily
-        else:
-            watch_penalty = 0.0
-
-        # Category affinity (0–20 pts)
-        category_score = top_categories.get(vid_cat, 0) * 20
-
-        # Collaborative filtering boost (0–10 pts)
-        collab_boost = 8.0 if vid_id in collab_video_ids else 0.0
-
-        # Save signal — user saved similar category content
-        save_boost = 3.0 if vid_id in saved_ids else 0.0
-
-        sc = score_video(
-            dict(row),
-            follow_boost=follow_boost,
-            watch_penalty=watch_penalty,
-            category_score=category_score,
-            collab_boost=collab_boost,
-            save_boost=save_boost,
+    # ---- 3. Fetch 24h Velocity / Trending Stats ----
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    placeholders = ",".join("?" * len(vid_ids_in_feed))
+    stats_rows = []
+    try:
+        stats_rows = db.execute(
+            f"""SELECT video_id, SUM(views) as v_24h, SUM(likes) as l_24h, SUM(shares) as sh_24h, SUM(comments) as c_24h
+                FROM video_daily_stats
+                WHERE video_id IN ({placeholders}) AND stat_date >= ?
+                GROUP BY video_id""",
+            vid_ids_in_feed + [yesterday]
+        ).fetchall()
+    except Exception: pass
+    
+    velocity_map = {}
+    for sr in stats_rows:
+        velocity_map[sr["video_id"]] = (
+            (sr["v_24h"] or 0) * 0.4 +
+            (sr["l_24h"] or 0) * 0.3 +
+            (sr["c_24h"] or 0) * 0.2 +
+            (sr["sh_24h"] or 0) * 0.1
         )
+    max_velocity = max(velocity_map.values(), default=1) or 1
 
-        scored.append((sc, row))
+    # ---- 4. Score each video ----
+    scored = []
+    for row in rows:
+        vid_id = row["id"]
+        cid = row["creator_id"]
+        
+        if cid in blocked_ids:
+            continue
+
+        vid_cat = row["category"]
+        views = row["views"] or 0
+        likes = row["like_count"] or 0
+        shares = row["share_count"] or 0
+        saves = row.get("save_count") or 0
+        age_h = _age_hours(row.get("created_at", ""))
+        
+        breakdown = {}
+
+        # 1. Watch Completion
+        comp_rate = watched_completion.get(vid_id)
+        if comp_rate is None:
+            comp_rate = row.get("avg_completion_rate") or 0.0
+        s_completion = min((comp_rate / 0.8) * weights["completion"], weights["completion"])
+        breakdown["completion"] = s_completion
+
+        # 2. Category Affinity
+        s_category = top_categories.get(vid_cat, 0.0) * weights["category"]
+        breakdown["category"] = s_category
+
+        # 3. Following Affinity
+        s_following = weights["following"] if cid in followed_ids else 0.0
+        breakdown["following"] = s_following
+
+        # 4. Likes, Shares, Saves (Engagement Rates)
+        view_denom = max(views, 1)
+        like_rate = min(likes / view_denom / 0.1, 1.0) # 10% like rate = max score
+        s_likes = like_rate * weights["likes"]
+        
+        share_rate = min(shares / view_denom / 0.05, 1.0) # 5% share rate = max score
+        s_shares = share_rate * weights["shares"]
+        
+        save_rate = min(saves / view_denom / 0.05, 1.0)
+        s_saves = save_rate * weights["saves"]
+        breakdown["likes"] = s_likes
+        breakdown["shares"] = s_shares
+        breakdown["saves"] = s_saves
+
+        # 5. Freshness
+        s_freshness = 0.0
+        if age_h < 24: s_freshness = weights["freshness"]
+        elif age_h < 168: s_freshness = weights["freshness"] * 0.5
+        elif age_h < 336: s_freshness = weights["freshness"] * 0.2
+        breakdown["freshness"] = s_freshness
+
+        # 6. Trending (Velocity)
+        vel = velocity_map.get(vid_id, 0.0)
+        s_trending = min((vel / max_velocity) * weights["trending"], weights["trending"])
+        breakdown["trending"] = s_trending
+
+        # 7. Age / Cold Start
+        s_age = 0.0
+        if 0 < user_age <= 15 and vid_cat in ("kids", "youth", "worship"):
+            s_age = weights["age"]
+        elif 16 <= user_age <= 18 and vid_cat in ("youth", "worship", "testimony"):
+            s_age = weights["age"]
+        elif 19 <= user_age <= 25 and vid_cat in ("sermons", "worship", "bible_study", "testimony"):
+            s_age = weights["age"]
+        elif 26 <= user_age <= 40 and vid_cat in ("sermons", "bible_study", "worship"):
+            s_age = weights["age"]
+        elif 41 <= user_age <= 60 and vid_cat in ("sermons", "bible_study", "prayer"):
+            s_age = weights["age"]
+        elif user_age > 60 and vid_cat in ("prayer", "worship", "bible_study"):
+            s_age = weights["age"]
+
+        # Decay age based on history
+        if history_count > 100: s_age *= 0.1
+        elif history_count > 50: s_age *= 0.4
+        elif history_count > 20: s_age *= 0.7
+        breakdown["age"] = s_age
+
+        # 8. Exploration
+        s_explore = 0.0
+        if views < 500: s_explore += weights["exploration"] * 0.5
+        s_explore += random.uniform(0, weights["exploration"] * 0.5)
+        breakdown["exploration"] = s_explore
+
+        # 9. Quality Floor
+        s_quality = 0.0
+        if len(row["title"]) > 5 and row["duration"] != "0:00":
+            s_quality = 2.0
+        breakdown["quality"] = s_quality
+
+        # 10. Negative Feedback
+        s_penalty = 0.0
+        if vid_id in skip_ids:
+            s_penalty = -15.0
+        breakdown["penalty"] = s_penalty
+
+        total_score = sum(breakdown.values())
+        
+        # Featured override
+        if row.get("is_featured"):
+            total_score += 100.0
+
+        scored.append((total_score, dict(row), breakdown))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     total = len(scored)
 
-    # ---- Creator Diversity: max 3 videos per creator per page ----
+    # ---- 5. Creator Diversity & Paging ----
     start = page * limit
-    all_sorted = scored  # already sorted
     creator_count: dict[str, int] = {}
-    paged: list[tuple[float, sqlite3.Row]] = []
-    skipped = 0
-
-    for score, row in all_sorted:
+    paged = []
+    
+    for score, row, brk in scored:
         if len(paged) >= limit + start:
             break
         cid = row["creator_id"]
-        creator_count[cid] = creator_count.get(cid, 0) + 1
-        if creator_count[cid] > 3:  # Max 3 per creator per feed request
-            continue
-        paged.append((score, row))
+        cc = creator_count.get(cid, 0)
+        
+        # Diversity penalty
+        if cc > 0:
+            score -= 15.0 * cc
+            brk["diversity_penalty"] = -15.0 * cc
+            
+        creator_count[cid] = cc + 1
+        paged.append((score, row, brk))
 
+    # Resort after diversity penalty for just this page
+    # Not perfect globally but works for MVP paging
+    paged.sort(key=lambda x: x[0], reverse=True)
     paged = paged[start: start + limit]
 
-    # ---- Build result items ----
+    # ---- 6. Build result items ----
     items = []
-    for _, row in paged:
+    for score, row, brk in paged:
         vid_id    = row["id"]
         liked     = vid_id in liked_ids
         saved     = vid_id in saved_ids
@@ -940,13 +812,11 @@ def _build_feed(
 
         d = video_to_dict(row, liked=liked, saved=saved, following=following)
         d["progress"] = prog
-        # Surface algorithm confidence for debugging (remove in prod)
-        # d["_score"] = round(score, 2)
+        d["_scoreBreakdown"] = {k: round(v, 2) for k, v in brk.items()}
+        d["_totalScore"] = round(score, 2)
         items.append(d)
 
     return items, total
-
-
 # ---------------------------------------------------------------------------
 # HTTP Handler
 # ---------------------------------------------------------------------------
@@ -1700,6 +1570,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             db.execute("UPDATE videos SET like_count=like_count+1 WHERE id=?", (vid_id,))
             liked = True
+            _log_daily_stat(db, vid_id, "likes")
 
             # notification for video creator (not self-like)
             if video["creator_id"] != uid:
@@ -1733,6 +1604,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if existing:
             db.execute("DELETE FROM saves WHERE user_id=? AND video_id=?", (uid, vid_id))
+            db.execute("UPDATE videos SET save_count=MAX(0, save_count-1) WHERE id=?", (vid_id,))
             saved = False
         else:
             now = utcnow()
@@ -1740,7 +1612,9 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO saves (user_id, video_id, created_at) VALUES (?,?,?)",
                 (uid, vid_id, now),
             )
+            db.execute("UPDATE videos SET save_count=save_count+1 WHERE id=?", (vid_id,))
             saved = True
+            _log_daily_stat(db, vid_id, "saves")
 
         db.commit()
         self._json({"saved": saved})
@@ -1778,6 +1652,7 @@ class Handler(BaseHTTPRequestHandler):
                     (uid, vid_id, progress, watch_time, completion, now),
                 )
                 db.execute("UPDATE videos SET views=views+1 WHERE id=?", (vid_id,))
+                _log_daily_stat(db, vid_id, "views")
 
             db.execute(
                 "UPDATE videos SET watch_time_total=watch_time_total+? WHERE id=?",
@@ -1819,6 +1694,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # Anonymous: just increment views every time
             db.execute("UPDATE videos SET views=views+1 WHERE id=?", (vid_id,))
+            _log_daily_stat(db, vid_id, "views")
             _update_recent_views(db, vid_id)
 
         db.commit()
@@ -1871,6 +1747,7 @@ class Handler(BaseHTTPRequestHandler):
             (cid, vid_id, user["id"], user["name"], user["handle"], content, 0, now),
         )
         db.execute("UPDATE videos SET comment_count=comment_count+1 WHERE id=?", (vid_id,))
+        _log_daily_stat(db, vid_id, "comments")
 
         # notification for video creator (not self-comment)
         if video["creator_id"] != user["id"]:
