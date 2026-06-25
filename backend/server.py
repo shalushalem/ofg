@@ -11,7 +11,8 @@ import json
 import os
 import re
 import secrets
-import sqlite3
+import psycopg2
+import psycopg2.extras
 import urllib.parse
 import urllib.request
 import base64
@@ -258,12 +259,35 @@ CREATE INDEX IF NOT EXISTS idx_payouts_status ON payouts(status);
 """
 
 
-def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+
+class DBWrapper:
+    def __init__(self, conn):
+        self.conn = conn
+
+    def execute(self, sql: str, params: tuple | list = ()):
+        sql_pg = sql.replace("?", "%s")
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(sql_pg, params)
+        except Exception as e:
+            print(f"[DB ERROR] {e} -> {sql_pg} | params: {params}")
+            self.conn.rollback()
+            raise
+        return cur
+
+    def commit(self):
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+def get_db() -> DBWrapper:
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise Exception("DATABASE_URL environment variable is missing")
+    conn = psycopg2.connect(db_url)
+    conn.autocommit = False
+    return DBWrapper(conn)
 
 
 def init_db() -> None:
@@ -274,7 +298,7 @@ def init_db() -> None:
             if stmt:
                 try:
                     conn.execute(stmt)
-                except sqlite3.OperationalError:
+                except psycopg2.Error:
                     pass
         conn.commit()
         _migrate_db(conn)
@@ -283,7 +307,7 @@ def init_db() -> None:
     finally:
         conn.close()
 
-def _seed_config(conn: sqlite3.Connection) -> None:
+def _seed_config(conn: DBWrapper) -> None:
     defaults = {
         "feed_completion": 25.0,
         "feed_category": 25.0,
@@ -300,7 +324,7 @@ def _seed_config(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _migrate_db(conn: sqlite3.Connection) -> None:
+def _migrate_db(conn: DBWrapper) -> None:
     """Safely add new algorithm columns to existing databases."""
     migrations = [
         "ALTER TABLE videos ADD COLUMN impressions INTEGER DEFAULT 0",
@@ -384,13 +408,13 @@ def _migrate_db(conn: sqlite3.Connection) -> None:
     for m in migrations:
         try:
             conn.execute(m)
-        except sqlite3.OperationalError:
+        except psycopg2.Error:
             pass  # Column/table already exists — safe to ignore
     conn.commit()
 
 
 
-def _seed_users(conn: sqlite3.Connection) -> None:
+def _seed_users(conn: DBWrapper) -> None:
     count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     if count > 0:
         return
@@ -519,7 +543,7 @@ def _get_weights(db) -> dict:
 # ---------------------------------------------------------------------------
 
 def _build_feed(
-    db: sqlite3.Connection,
+    db: DBWrapper,
     user=None,
     category: str = "",
     is_short: Optional[bool] = None,
@@ -867,7 +891,7 @@ class Handler(BaseHTTPRequestHandler):
             return auth[7:].strip()
         return None
 
-    def _user(self, db: sqlite3.Connection):
+    def _user(self, db: DBWrapper):
         token = self._token()
         if not token:
             return None
@@ -878,14 +902,14 @@ class Handler(BaseHTTPRequestHandler):
             "SELECT * FROM users WHERE id=? AND is_banned=0", (sess["user_id"],)
         ).fetchone()
 
-    def _require_user(self, db: sqlite3.Connection):
+    def _require_user(self, db: DBWrapper):
         user = self._user(db)
         if not user:
             self._error("Unauthorized", 401)
             return None
         return user
 
-    def _require_admin(self, db: sqlite3.Connection) -> bool:
+    def _require_admin(self, db: DBWrapper) -> bool:
         secret = self.headers.get("X-Admin-Secret", "")
         if secret == ADMIN_SECRET:
             return True
@@ -914,7 +938,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             db.close()
 
-    def _route_get(self, db: sqlite3.Connection):
+    def _route_get(self, db: DBWrapper):
         path = self._path()
         qs   = self._qs()
 
@@ -1177,7 +1201,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             db.close()
 
-    def _route_post(self, db: sqlite3.Connection):
+    def _route_post(self, db: DBWrapper):
         path = self._path()
 
         if path == "/auth/register":
@@ -1389,7 +1413,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Auth ----
 
-    def _handle_register(self, db: sqlite3.Connection):
+    def _handle_register(self, db: DBWrapper):
         body = self._body()
         name  = (body.get("name") or "").strip()
         email = (body.get("email") or "").strip().lower()
@@ -1445,7 +1469,7 @@ class Handler(BaseHTTPRequestHandler):
         user_row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         self._json({"token": token, "user": user_to_dict(user_row)}, 201)
 
-    def _handle_login(self, db: sqlite3.Connection):
+    def _handle_login(self, db: DBWrapper):
         body  = self._body()
         email = (body.get("email") or "").strip().lower()
         password = body.get("password") or ""
@@ -1474,7 +1498,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"token": token, "user": user_to_dict(user)})
 
-    def _handle_logout(self, db: sqlite3.Connection):
+    def _handle_logout(self, db: DBWrapper):
         token = self._token()
         if token:
             db.execute("DELETE FROM sessions WHERE token=?", (token,))
@@ -1483,7 +1507,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Feed ----
 
-    def _handle_feed(self, db: sqlite3.Connection, qs: dict):
+    def _handle_feed(self, db: DBWrapper, qs: dict):
         category = qs.get("category", "")
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
@@ -1493,7 +1517,7 @@ class Handler(BaseHTTPRequestHandler):
         items, total = _build_feed(db, user=user, category=category, page=page, limit=limit)
         self._json({"items": items, "total": total, "page": page})
 
-    def _handle_video_get(self, db: sqlite3.Connection, vid_id: str):
+    def _handle_video_get(self, db: DBWrapper, vid_id: str):
         row = db.execute(
             """SELECT v.*, u.avatar_url, u.is_verified
                FROM videos v JOIN users u ON u.id=v.creator_id
@@ -1520,7 +1544,7 @@ class Handler(BaseHTTPRequestHandler):
         d["progress"] = prog
         self._json({"video": d})
 
-    def _handle_shorts(self, db: sqlite3.Connection, qs: dict):
+    def _handle_shorts(self, db: DBWrapper, qs: dict):
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
         limit = min(limit, 100)
@@ -1528,7 +1552,7 @@ class Handler(BaseHTTPRequestHandler):
         items, total = _build_feed(db, user=user, is_short=True, page=page, limit=limit)
         self._json({"items": items, "total": total, "page": page})
 
-    def _handle_search(self, db: sqlite3.Connection, qs: dict):
+    def _handle_search(self, db: DBWrapper, qs: dict):
         q        = qs.get("q", "").strip()
         category = qs.get("category", "")
         page     = int(qs.get("page", 0))
@@ -1543,7 +1567,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Video Interactions ----
 
-    def _handle_like(self, db: sqlite3.Connection, vid_id: str):
+    def _handle_like(self, db: DBWrapper, vid_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1587,7 +1611,7 @@ class Handler(BaseHTTPRequestHandler):
         new_count = db.execute("SELECT like_count FROM videos WHERE id=?", (vid_id,)).fetchone()["like_count"]
         self._json({"liked": liked, "likeCount": new_count})
 
-    def _handle_save(self, db: sqlite3.Connection, vid_id: str):
+    def _handle_save(self, db: DBWrapper, vid_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1619,7 +1643,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"saved": saved})
 
-    def _handle_watch(self, db: sqlite3.Connection, vid_id: str):
+    def _handle_watch(self, db: DBWrapper, vid_id: str):
         body          = self._body()
         watch_time    = float(body.get("watchTime", 0))
         completion    = float(body.get("completionRate", 0))
@@ -1702,7 +1726,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Comments ----
 
-    def _handle_comments_get(self, db: sqlite3.Connection, vid_id: str, qs: dict):
+    def _handle_comments_get(self, db: DBWrapper, vid_id: str, qs: dict):
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
         limit = min(limit, 100)
@@ -1720,7 +1744,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [comment_to_dict(r) for r in rows], "total": total})
 
-    def _handle_comment_post(self, db: sqlite3.Connection, vid_id: str):
+    def _handle_comment_post(self, db: DBWrapper, vid_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1767,7 +1791,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Follows ----
 
-    def _handle_follow(self, db: sqlite3.Connection, creator_id: str):
+    def _handle_follow(self, db: DBWrapper, creator_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1822,7 +1846,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- User Profiles ----
 
-    def _handle_user_profile(self, db: sqlite3.Connection, user_id: str):
+    def _handle_user_profile(self, db: DBWrapper, user_id: str):
         u = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not u:
             self._error("User not found", 404)
@@ -1858,7 +1882,7 @@ class Handler(BaseHTTPRequestHandler):
             "videoCount": video_count,
         })
 
-    def _handle_user_update(self, db: sqlite3.Connection, user):
+    def _handle_user_update(self, db: DBWrapper, user):
         body = self._body()
         uid  = user["id"]
 
@@ -1886,7 +1910,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Upload ----
 
-    def _handle_upload_init(self, db: sqlite3.Connection, user):
+    def _handle_upload_init(self, db: DBWrapper, user):
         body         = self._body()
         filename     = (body.get("filename") or "").strip()
         content_type = (body.get("contentType") or "application/octet-stream").strip()
@@ -1918,7 +1942,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"uploadUrl": upload_url, "mediaUrl": media_url, "key": key})
 
-    def _handle_upload_proxy(self, db: sqlite3.Connection, user):
+    def _handle_upload_proxy(self, db: DBWrapper, user):
         """
         Phone streams raw file bytes here.
         Server uploads to R2 via boto3 (server-to-R2 works; phone-to-R2 fails on some ISPs).
@@ -1976,7 +2000,7 @@ class Handler(BaseHTTPRequestHandler):
         media_url = r2_public_url(key, pub_url=pub_url, bucket=bucket)
         self._json({"mediaUrl": media_url, "key": key})
 
-    def _handle_upload(self, db: sqlite3.Connection, user):
+    def _handle_upload(self, db: DBWrapper, user):
         body         = self._body()
         title        = (body.get("title") or "").strip()
         description  = (body.get("description") or "").strip()
@@ -2014,7 +2038,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Creator ----
 
-    def _handle_creator_stats(self, db: sqlite3.Connection, user):
+    def _handle_creator_stats(self, db: DBWrapper, user):
         uid = user["id"]
         stats = db.execute(
             """SELECT
@@ -2063,7 +2087,7 @@ class Handler(BaseHTTPRequestHandler):
             "topCategory": top_category,
         })
 
-    def _handle_creator_videos(self, db: sqlite3.Connection, user, qs: dict):
+    def _handle_creator_videos(self, db: DBWrapper, user, qs: dict):
         uid   = user["id"]
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
@@ -2086,7 +2110,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Library ----
 
-    def _handle_history(self, db: sqlite3.Connection, user):
+    def _handle_history(self, db: DBWrapper, user):
         uid  = user["id"]
         rows = db.execute(
             """SELECT v.*, u.avatar_url, u.is_verified, h.progress
@@ -2106,7 +2130,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": items})
 
-    def _handle_saved(self, db: sqlite3.Connection, user):
+    def _handle_saved(self, db: DBWrapper, user):
         uid  = user["id"]
         rows = db.execute(
             """SELECT v.*, u.avatar_url, u.is_verified
@@ -2122,12 +2146,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Settings ----
 
-    def _handle_settings_get(self, db: sqlite3.Connection, user):
+    def _handle_settings_get(self, db: DBWrapper, user):
         uid  = user["id"]
         rows = db.execute("SELECT key, value FROM settings WHERE user_id=?", (uid,)).fetchall()
         self._json({"settings": {r["key"]: r["value"] for r in rows}})
 
-    def _handle_settings_post(self, db: sqlite3.Connection, user):
+    def _handle_settings_post(self, db: DBWrapper, user):
         body  = self._body()
         key   = (body.get("key") or "").strip()
         value = body.get("value")
@@ -2149,7 +2173,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Notifications ----
 
-    def _handle_notifications_get(self, db: sqlite3.Connection, user):
+    def _handle_notifications_get(self, db: DBWrapper, user):
         uid  = user["id"]
         rows = db.execute(
             """SELECT * FROM notifications WHERE user_id=?
@@ -2168,7 +2192,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Reports ----
 
-    def _handle_report(self, db: sqlite3.Connection, user):
+    def _handle_report(self, db: DBWrapper, user):
         body      = self._body()
         rtype     = (body.get("type") or "").strip()
         target_id = (body.get("targetId") or "").strip()
@@ -2193,7 +2217,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Admin ----
 
-    def _handle_admin_videos(self, db: sqlite3.Connection, qs: dict):
+    def _handle_admin_videos(self, db: DBWrapper, qs: dict):
         status = qs.get("status", "all")
         page   = int(qs.get("page", 0))
         limit  = int(qs.get("limit", 50))
@@ -2221,7 +2245,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [video_to_dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_admin_feature(self, db: sqlite3.Connection, vid_id: str):
+    def _handle_admin_feature(self, db: DBWrapper, vid_id: str):
         video = db.execute("SELECT id, is_featured FROM videos WHERE id=?", (vid_id,)).fetchone()
         if not video:
             self._error("Video not found", 404)
@@ -2231,7 +2255,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"ok": True, "featured": bool(new_val)})
 
-    def _handle_admin_ban(self, db: sqlite3.Connection, user_id: str):
+    def _handle_admin_ban(self, db: DBWrapper, user_id: str):
         u = db.execute("SELECT id, is_banned FROM users WHERE id=?", (user_id,)).fetchone()
         if not u:
             self._error("User not found", 404)
@@ -2243,7 +2267,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"ok": True, "banned": bool(new_val)})
 
-    def _handle_admin_reports(self, db: sqlite3.Connection, qs: dict):
+    def _handle_admin_reports(self, db: DBWrapper, qs: dict):
         status = qs.get("status", "pending")
         page   = int(qs.get("page", 0))
         limit  = int(qs.get("limit", 50))
@@ -2263,7 +2287,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [report_to_dict(r) for r in rows]})
 
-    def _handle_admin_report_resolve(self, db: sqlite3.Connection, report_id: str):
+    def _handle_admin_report_resolve(self, db: DBWrapper, report_id: str):
         body   = self._body()
         status = (body.get("status") or "").strip()
         if status not in ("resolved", "dismissed"):
@@ -2283,7 +2307,7 @@ class Handler(BaseHTTPRequestHandler):
 
     PLATFORM_FEE_RATE = 0.10  # 10% platform fee
 
-    def _ensure_wallet(self, db: sqlite3.Connection, creator_id: str):
+    def _ensure_wallet(self, db: DBWrapper, creator_id: str):
         """Create a wallet row for creator if one doesn't exist."""
         db.execute(
             """INSERT OR IGNORE INTO creator_wallets
@@ -2293,7 +2317,7 @@ class Handler(BaseHTTPRequestHandler):
             (creator_id, utcnow()),
         )
 
-    def _handle_donate(self, db: sqlite3.Connection, user):
+    def _handle_donate(self, db: DBWrapper, user):
         body = self._body()
         creator_id  = body.get("creatorId", "").strip()
         amount      = float(body.get("amount", 0))
@@ -2406,7 +2430,7 @@ class Handler(BaseHTTPRequestHandler):
             "message": "Donation successful! God bless you 🙏",
         })
 
-    def _handle_donation_history(self, db: sqlite3.Connection, user, qs: dict):
+    def _handle_donation_history(self, db: DBWrapper, user, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 20)), 100)
         offset = page * limit
@@ -2427,7 +2451,7 @@ class Handler(BaseHTTPRequestHandler):
         items = [dict(r) for r in rows]
         self._json({"items": items, "total": total, "page": page})
 
-    def _handle_creator_wallet_get(self, db: sqlite3.Connection, user):
+    def _handle_creator_wallet_get(self, db: DBWrapper, user):
         self._ensure_wallet(db, user["id"])
         db.commit()
         wallet = db.execute(
@@ -2435,7 +2459,7 @@ class Handler(BaseHTTPRequestHandler):
         ).fetchone()
         self._json(dict(wallet))
 
-    def _handle_public_wallet(self, db: sqlite3.Connection, creator_id: str):
+    def _handle_public_wallet(self, db: DBWrapper, creator_id: str):
         """Public-facing minimal wallet stats (for creator profile page)."""
         wallet = db.execute(
             """SELECT total_supporters, lifetime_donations, monthly_earnings
@@ -2451,7 +2475,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"totalSupporters": 0, "lifetimeDonations": 0.0, "monthlyEarnings": 0.0})
 
-    def _handle_creator_donations_list(self, db: sqlite3.Connection, user, qs: dict):
+    def _handle_creator_donations_list(self, db: DBWrapper, user, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 20)), 100)
         offset = page * limit
@@ -2476,7 +2500,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_creator_payouts_list(self, db: sqlite3.Connection, user, qs: dict):
+    def _handle_creator_payouts_list(self, db: DBWrapper, user, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 20)), 100)
         offset = page * limit
@@ -2493,7 +2517,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_creator_payout_request(self, db: sqlite3.Connection, user):
+    def _handle_creator_payout_request(self, db: DBWrapper, user):
         body = self._body()
         amount = float(body.get("amount", 0))
 
@@ -2544,7 +2568,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"ok": True, "payoutId": payout_id, "status": "pending"})
 
-    def _handle_creator_payout_account(self, db: sqlite3.Connection, user):
+    def _handle_creator_payout_account(self, db: DBWrapper, user):
         body = self._body()
         account = str(body.get("payoutAccount", "")).strip()
         if not account:
@@ -2560,7 +2584,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Admin Donation Handlers ----
 
-    def _handle_admin_donations(self, db: sqlite3.Connection, qs: dict):
+    def _handle_admin_donations(self, db: DBWrapper, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 30)), 100)
         offset = page * limit
@@ -2599,7 +2623,7 @@ class Handler(BaseHTTPRequestHandler):
             "page": page,
         })
 
-    def _handle_admin_payouts(self, db: sqlite3.Connection, qs: dict):
+    def _handle_admin_payouts(self, db: DBWrapper, qs: dict):
         page   = int(qs.get("page", 0))
         limit  = min(int(qs.get("limit", 30)), 100)
         offset = page * limit
@@ -2622,7 +2646,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_admin_payout_approve(self, db: sqlite3.Connection, payout_id: str):
+    def _handle_admin_payout_approve(self, db: DBWrapper, payout_id: str):
         payout = db.execute(
             "SELECT * FROM payouts WHERE id=?", (payout_id,)
         ).fetchone()
@@ -2664,7 +2688,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"ok": True, "status": "paid"})
 
-    def _handle_admin_payout_reject(self, db: sqlite3.Connection, payout_id: str):
+    def _handle_admin_payout_reject(self, db: DBWrapper, payout_id: str):
         body = self._body()
         reason = str(body.get("reason", "Rejected by admin")).strip()
 
