@@ -276,10 +276,24 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
     ref.read(authStateProvider.notifier).state = null;
   }
 
+  Future<bool> _onWillPop() async {
+    if (_activeVideo != null) {
+      _closeVideo();
+      return false;
+    }
+    if (_currentIndex != 0) {
+      setState(() => _currentIndex = 0);
+      return false;
+    }
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: kBg,
+    return WillPopScope(
+      onWillPop: _onWillPop,
+      child: Scaffold(
+        backgroundColor: kBg,
       body: Stack(
         children: [
           _buildCurrentPage(),
@@ -301,6 +315,7 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
           if (_activeVideo == null) _buildBottomNav(),
         ],
       ),
+    ),
     );
   }
 
