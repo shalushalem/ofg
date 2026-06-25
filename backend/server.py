@@ -429,7 +429,7 @@ def _migrate_db(conn: DBWrapper) -> None:
 
 
 def _seed_users(conn: DBWrapper) -> None:
-    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    count = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
     if count > 0:
         return
 
@@ -771,10 +771,12 @@ def _build_feed(
         followed_ids = {r["creator_id"] for r in foll}
 
         # Watch history
-        hist = db.execute("SELECT video_id, completion_rate FROM history WHERE user_id=?", (uid,)).fetchall()
+        hist = db.execute("SELECT video_id, completion_rate, progress FROM history WHERE user_id=?", (uid,)).fetchall()
         history_count = len(hist)
+        watched_progress: dict[str, float] = {}
         for r in hist:
             watched_completion[r["video_id"]] = float(r["completion_rate"] or 0)
+            watched_progress[r["video_id"]] = float(r["progress"] or 0)
 
         # Skips (completion < 15%)
         try:
@@ -970,12 +972,7 @@ def _build_feed(
 
         prog = 0.0
         if user and vid_id in watched_completion:
-            hr = db.execute(
-                "SELECT progress FROM history WHERE user_id=? AND video_id=?",
-                (user["id"], vid_id),
-            ).fetchone()
-            if hr:
-                prog = float(hr["progress"] or 0)
+            prog = watched_progress.get(vid_id, 0.0)
 
         d = video_to_dict(row, liked=liked, saved=saved, following=following)
         d["progress"] = prog
@@ -1876,8 +1873,8 @@ class Handler(BaseHTTPRequestHandler):
         offset = page * limit
 
         total = db.execute(
-            "SELECT COUNT(*) FROM comments WHERE video_id=?", (vid_id,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM comments WHERE video_id=?", (vid_id,)
+        ).fetchone()["count"]
 
         rows = db.execute(
             """SELECT * FROM comments WHERE video_id=?
@@ -2004,8 +2001,8 @@ class Handler(BaseHTTPRequestHandler):
         ).fetchall()
 
         video_count = db.execute(
-            "SELECT COUNT(*) FROM videos WHERE creator_id=? AND is_removed=0", (user_id,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM videos WHERE creator_id=? AND is_removed=0", (user_id,)
+        ).fetchone()["count"]
 
         me = self._user(db)
         following = False
@@ -2238,8 +2235,8 @@ class Handler(BaseHTTPRequestHandler):
         offset = page * limit
 
         total = db.execute(
-            "SELECT COUNT(*) FROM videos WHERE creator_id=? AND is_removed=0", (uid,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM videos WHERE creator_id=? AND is_removed=0", (uid,)
+        ).fetchone()["count"]
 
         rows = db.execute(
             """SELECT v.*, u.avatar_url, u.is_verified
@@ -2325,8 +2322,8 @@ class Handler(BaseHTTPRequestHandler):
         ).fetchall()
 
         unread = db.execute(
-            "SELECT COUNT(*) FROM notifications WHERE user_id=? AND is_read=0", (uid,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM notifications WHERE user_id=? AND is_read=0", (uid,)
+        ).fetchone()["count"]
 
         self._json({
             "items": [notification_to_dict(r) for r in rows],
@@ -2383,8 +2380,8 @@ class Handler(BaseHTTPRequestHandler):
         ).fetchall()
 
         total = db.execute(
-            f"SELECT COUNT(*) FROM videos v {where}"
-        ).fetchone()[0]
+            f"SELECT COUNT(*) AS count FROM videos v {where}"
+        ).fetchone()["count"]
 
         self._json({"items": [video_to_dict(r) for r in rows], "total": total, "page": page})
 
@@ -2488,9 +2485,9 @@ class Handler(BaseHTTPRequestHandler):
         # --- Rate limiting: max 3 donations per hour per user ---
         one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         recent_count = db.execute(
-            "SELECT COUNT(*) FROM donations WHERE donor_id=? AND created_at > ?",
+            "SELECT COUNT(*) AS count FROM donations WHERE donor_id=? AND created_at > ?",
             (user["id"], one_hour_ago),
-        ).fetchone()[0]
+        ).fetchone()["count"]
         if recent_count >= 3:
             self._error("Too many donations. Please wait before donating again.")
             return
@@ -2579,8 +2576,8 @@ class Handler(BaseHTTPRequestHandler):
         offset = page * limit
 
         total = db.execute(
-            "SELECT COUNT(*) FROM donations WHERE donor_id=?", (user["id"],)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM donations WHERE donor_id=?", (user["id"],)
+        ).fetchone()["count"]
 
         rows = db.execute(
             """SELECT d.*, u.name as creator_name, u.avatar_url as creator_avatar
@@ -2624,8 +2621,8 @@ class Handler(BaseHTTPRequestHandler):
         offset = page * limit
 
         total = db.execute(
-            "SELECT COUNT(*) FROM donations WHERE creator_id=?", (user["id"],)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM donations WHERE creator_id=?", (user["id"],)
+        ).fetchone()["count"]
 
         rows = db.execute(
             """SELECT d.id, d.amount, d.platform_fee, d.creator_amount, d.message,
@@ -2649,8 +2646,8 @@ class Handler(BaseHTTPRequestHandler):
         offset = page * limit
 
         total = db.execute(
-            "SELECT COUNT(*) FROM payouts WHERE creator_id=?", (user["id"],)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM payouts WHERE creator_id=?", (user["id"],)
+        ).fetchone()["count"]
 
         rows = db.execute(
             """SELECT * FROM payouts WHERE creator_id=?
@@ -2739,7 +2736,7 @@ class Handler(BaseHTTPRequestHandler):
             cond = "WHERE d.status=?"
             params.append(status)
 
-        total = db.execute(f"SELECT COUNT(*) FROM donations d {cond}", params).fetchone()[0]
+        total = db.execute(f"SELECT COUNT(*) AS count FROM donations d {cond}", params).fetchone()["count"]
 
         rows = db.execute(
             f"""SELECT d.*, u.name as donor_name, c.name as creator_name
@@ -2773,8 +2770,8 @@ class Handler(BaseHTTPRequestHandler):
         status = qs.get("status", "pending")
 
         total = db.execute(
-            "SELECT COUNT(*) FROM payouts WHERE status=?", (status,)
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM payouts WHERE status=?", (status,)
+        ).fetchone()["count"]
 
         rows = db.execute(
             """SELECT p.*, u.name as creator_name, u.email as creator_email,
