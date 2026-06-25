@@ -19,8 +19,8 @@ class CreateSheet extends ConsumerStatefulWidget {
 
 class _CreateSheetState extends ConsumerState<CreateSheet> {
   int _step = 0; // 0 = menu, 1 = upload form
-  bool _isShort = false;
 
+  bool _isShort = false;
   final _titleController = TextEditingController();
   final _descController = TextEditingController();
   String _category = 'sermons';
@@ -30,8 +30,9 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
   int _videoSize = 0;
 
   bool _uploading = false;
-  bool _picking = false;  // Guard against "already active" crash
-  double _progress = 0.0;
+  bool _picking = false;
+  double _progress = 0.0;       // 0.0 – 1.0
+  String _statusMsg = '';       // shown below the progress bar
 
   @override
   void dispose() {
@@ -40,25 +41,9 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
     super.dispose();
   }
 
-  Future<void> _pickThumbnail() async {
-    if (_picking) return;
-    setState(() => _picking = true);
-    try {
-      final picker = ImagePicker();
-      final picked = await picker.pickImage(source: ImageSource.gallery);
-      if (picked != null) {
-        setState(() {
-          _thumbnailFile = File(picked.path);
-        });
-      }
-    } catch (_) {
-    } finally {
-      if (mounted) setState(() => _picking = false);
-    }
-  }
+  // ─── helpers ────────────────────────────────────────────────────────────────
 
-  /// Detect MIME type from file extension
-  String _mimeType(String path) {
+  String _detectMime(String path) {
     final ext = path.split('.').last.toLowerCase();
     switch (ext) {
       case 'mp4':  return 'video/mp4';
@@ -71,18 +56,51 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
     }
   }
 
-  Future<void> _pickVideo() async {
+  void _setStatus(String msg, [double? progress]) {
+    if (!mounted) return;
+    setState(() {
+      _statusMsg = msg;
+      if (progress != null) _progress = progress.clamp(0.0, 1.0);
+    });
+  }
+
+  /// Shows a persistent error dialog — unlike SnackBar it won't auto-dismiss
+  void _showError(String message) {
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: kPanel2,
+        title: const Row(
+          children: [
+            Icon(Icons.error_outline, color: Colors.redAccent),
+            SizedBox(width: 8),
+            Text('Upload Failed', style: TextStyle(color: Colors.white)),
+          ],
+        ),
+        content: SelectableText(
+          message,
+          style: const TextStyle(color: kMuted, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('OK', style: TextStyle(color: kAccent)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ─── pickers ────────────────────────────────────────────────────────────────
+
+  Future<void> _pickThumbnail() async {
     if (_picking) return;
     setState(() => _picking = true);
     try {
-      final result = await FilePicker.platform.pickFiles(type: FileType.video);
-      if (result != null && result.files.single.path != null) {
-        final file = File(result.files.single.path!);
-        final size = await file.length();
-        setState(() {
-          _videoFile = file;
-          _videoSize = size;
-        });
+      final picked = await ImagePicker().pickImage(source: ImageSource.gallery);
+      if (picked != null && mounted) {
+        setState(() => _thumbnailFile = File(picked.path));
       }
     } catch (_) {
     } finally {
@@ -90,92 +108,115 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
     }
   }
 
+  Future<void> _pickVideo() async {
+    if (_picking) return;
+    setState(() => _picking = true);
+    try {
+      final result = await FilePicker.platform.pickFiles(type: FileType.video);
+      if (result != null && result.files.single.path != null && mounted) {
+        final file = File(result.files.single.path!);
+        final size = await file.length();
+        setState(() { _videoFile = file; _videoSize = size; });
+      }
+    } catch (_) {
+    } finally {
+      if (mounted) setState(() => _picking = false);
+    }
+  }
+
+  // ─── upload ─────────────────────────────────────────────────────────────────
+
   Future<void> _publish() async {
     if (_titleController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Please enter a title')));
+      _showError('Please enter a title for your video.');
       return;
     }
     if (_videoFile == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Please select a video file')));
+      _showError('Please select a video file.');
       return;
     }
 
-    setState(() { _uploading = true; _progress = 0.05; });
+    setState(() { _uploading = true; _progress = 0.02; _statusMsg = 'Preparing upload…'; });
 
     try {
       final api = ref.read(apiClientProvider);
 
-      // 1. Detect real MIME type from actual file extension
-      final videoPath = _videoFile!.path;
-      final videoMime = _mimeType(videoPath);
+      final videoPath     = _videoFile!.path;
+      final videoMime     = _detectMime(videoPath);
       final videoFileName = videoPath.split('/').last;
+      final videoSize     = _videoSize;
 
-      // 2. Get presigned upload URL from our backend
-      final videoInit = await api.initUpload(
-        filename: videoFileName,
-        contentType: videoMime,
+      // ── Phase 1: Upload video (0 → 70%) ──────────────────────────────────
+      _setStatus('Uploading video to server… 0%', 0.05);
+
+      final videoResult = await api.uploadViaProxy(
+        _videoFile!,
+        videoFileName,
+        videoMime,
         type: _isShort ? 'short' : 'video',
+        onProgress: (p) {
+          final pct = (p * 100).toStringAsFixed(0);
+          _setStatus(
+            'Uploading video… $pct%  '
+            '(${(p * videoSize / 1024 / 1024).toStringAsFixed(1)} / '
+            '${(videoSize / 1024 / 1024).toStringAsFixed(1)} MB)',
+            0.05 + p * 0.65,
+          );
+        },
       );
-      final videoUploadUrl = videoInit['uploadUrl'] as String;
-      final videoMediaUrl  = videoInit['mediaUrl']  as String;
+      final videoMediaUrl = videoResult['mediaUrl'] as String;
 
-      setState(() => _progress = 0.1);
-
-      // 3. STREAM video directly to R2 using the API Client
-      await api.streamedUpload(videoUploadUrl, _videoFile!, videoMime);
-
-      setState(() => _progress = 0.7);
-
-      // 4. Thumbnail upload (optional)
+      // ── Phase 2: Thumbnail (70 → 85%) ─────────────────────────────────────
+      _setStatus('Uploading thumbnail…', 0.70);
       String thumbnailUrl = '';
       if (_thumbnailFile != null) {
-        final thumbInit = await api.initUpload(
-          filename: _thumbnailFile!.path.split('/').last,
-          contentType: 'image/jpeg',
+        final thumbResult = await api.uploadViaProxy(
+          _thumbnailFile!,
+          _thumbnailFile!.path.split('/').last,
+          'image/jpeg',
           type: 'thumbnail',
+          onProgress: (p) => _setStatus('Uploading thumbnail… ${(p * 100).toStringAsFixed(0)}%', 0.70 + p * 0.15),
         );
-        thumbnailUrl = thumbInit['mediaUrl'] as String;
-        
-        // STREAM thumbnail safely
-        await api.streamedUpload(
-            thumbInit['uploadUrl'] as String, _thumbnailFile!, 'image/jpeg');
+        thumbnailUrl = thumbResult['mediaUrl'] as String;
       }
 
-      setState(() => _progress = 0.85);
+      // ── Phase 3: Save metadata (85 → 100%) ────────────────────────────────
+      _setStatus('Saving to database…', 0.87);
+      await api.post('/upload', {
+        'title':        _titleController.text.trim(),
+        'description':  _descController.text.trim(),
+        'category':     _category,
+        'mediaUrl':     videoMediaUrl,
+        'thumbnailUrl': thumbnailUrl,
+        'duration':     '0:00',
+        'isShort':      _isShort,
+      });
 
-      // 5. Save video metadata to the backend database
-      await api.submitUpload(
-        title:        _titleController.text.trim(),
-        description:  _descController.text.trim(),
-        category:     _category,
-        mediaUrl:     videoMediaUrl,
-        thumbnailUrl: thumbnailUrl,
-        duration:     '0:00',
-        isShort:      _isShort,
-      );
-
-      setState(() => _progress = 1.0);
+      _setStatus('Done!', 1.0);
       ref.invalidate(feedProvider);
       ref.invalidate(creatorVideosProvider);
 
+      await Future.delayed(const Duration(milliseconds: 400));
+
       if (mounted) {
         Navigator.pop(context);
-        ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-                content: Text('Video published successfully! 🎉'),
-                backgroundColor: Colors.green));
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Video published successfully! 🎉'),
+          backgroundColor: Colors.green,
+          duration: Duration(seconds: 4),
+        ));
       }
-    } catch (e) {
+    } catch (e, stack) {
+      debugPrint('Upload error: $e\n$stack');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Upload failed: $e')));
+        _showError(e.toString());
       }
     } finally {
-      if (mounted) setState(() => _uploading = false);
+      if (mounted) setState(() { _uploading = false; _progress = 0; _statusMsg = ''; });
     }
   }
+
+  // ─── build ───────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
@@ -189,8 +230,7 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
         children: [
           Container(
             margin: const EdgeInsets.only(top: 8, bottom: 8),
-            width: 40,
-            height: 4,
+            width: 40, height: 4,
             decoration: BoxDecoration(color: Colors.white30, borderRadius: BorderRadius.circular(2)),
           ),
           if (_step == 0) _buildMenu() else _buildForm(),
@@ -233,23 +273,35 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
   Widget _buildForm() {
     return Flexible(
       child: SingleChildScrollView(
-        padding: EdgeInsets.only(left: 16, right: 16, bottom: MediaQuery.of(context).viewInsets.bottom + 24),
+        padding: EdgeInsets.only(
+          left: 16, right: 16,
+          bottom: MediaQuery.of(context).viewInsets.bottom + 24,
+        ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            // ── header ────────────────────────────────────────────────────────
             Row(
               children: [
-                IconButton(icon: const Icon(Icons.arrow_back), onPressed: () => setState(() => _step = 0)),
-                Text(_isShort ? 'Upload Short' : 'Upload Message', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                IconButton(
+                  icon: const Icon(Icons.arrow_back),
+                  onPressed: _uploading ? null : () => setState(() => _step = 0),
+                ),
+                Text(
+                  _isShort ? 'Upload Short' : 'Upload Message',
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
               ],
             ),
             const SizedBox(height: 16),
+
+            // ── fields ────────────────────────────────────────────────────────
             OfgInput(controller: _titleController, label: 'Title'),
             const SizedBox(height: 16),
             OfgInput(controller: _descController, label: 'Description', maxLines: 3),
             const SizedBox(height: 16),
-            
-            // Category Dropdown
+
+            // Category
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               decoration: ofgPanelDecoration(),
@@ -262,49 +314,63 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
                       .where((c) => c != 'For You' && c != 'Live')
                       .map((c) => DropdownMenuItem(value: kCategoryApiMap[c]!, child: Text(c)))
                       .toList(),
-                  onChanged: (v) => setState(() => _category = v!),
+                  onChanged: _uploading ? null : (v) => setState(() => _category = v!),
                 ),
               ),
             ),
-            
             const SizedBox(height: 16),
+
+            // ── file pickers ──────────────────────────────────────────────────
             Row(
               children: [
                 Expanded(
                   child: GestureDetector(
-                    onTap: _pickThumbnail,
+                    onTap: _uploading ? null : _pickThumbnail,
                     child: Container(
                       height: 100,
                       decoration: BoxDecoration(
                         color: kPanel2,
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(color: kBorder),
-                        image: _thumbnailFile != null ? DecorationImage(image: FileImage(_thumbnailFile!), fit: BoxFit.cover) : null,
+                        image: _thumbnailFile != null
+                            ? DecorationImage(image: FileImage(_thumbnailFile!), fit: BoxFit.cover)
+                            : null,
                       ),
-                      child: _thumbnailFile == null ? const Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.image, color: kMuted),
-                          SizedBox(height: 4),
-                          Text('Add Thumbnail', style: TextStyle(color: kMuted, fontSize: 12)),
-                        ],
-                      ) : null,
+                      child: _thumbnailFile == null
+                          ? const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(Icons.image, color: kMuted),
+                                SizedBox(height: 4),
+                                Text('Add Thumbnail', style: TextStyle(color: kMuted, fontSize: 12)),
+                              ],
+                            )
+                          : null,
                     ),
                   ),
                 ),
                 const SizedBox(width: 16),
                 Expanded(
                   child: GestureDetector(
-                    onTap: _pickVideo,
+                    onTap: _uploading ? null : _pickVideo,
                     child: Container(
                       height: 100,
                       decoration: ofgPanelDecoration(),
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Icon(_videoFile != null ? Icons.check_circle : Icons.video_file, color: _videoFile != null ? Colors.green : kMuted),
+                          Icon(
+                            _videoFile != null ? Icons.check_circle : Icons.video_file,
+                            color: _videoFile != null ? Colors.green : kMuted,
+                          ),
                           const SizedBox(height: 4),
-                          Text(_videoFile != null ? '${(_videoSize / 1024 / 1024).toStringAsFixed(1)} MB' : 'Select Video', style: const TextStyle(color: kMuted, fontSize: 12)),
+                          Text(
+                            _videoFile != null
+                                ? '${(_videoSize / 1024 / 1024).toStringAsFixed(1)} MB selected'
+                                : 'Select Video',
+                            style: const TextStyle(color: kMuted, fontSize: 12),
+                            textAlign: TextAlign.center,
+                          ),
                         ],
                       ),
                     ),
@@ -312,17 +378,42 @@ class _CreateSheetState extends ConsumerState<CreateSheet> {
                 ),
               ],
             ),
-            
             const SizedBox(height: 24),
+
+            // ── progress block (visible while uploading) ──────────────────────
             if (_uploading) ...[
-              LinearProgressIndicator(value: _progress, backgroundColor: kBorder, color: kAccent),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    _statusMsg,
+                    style: const TextStyle(color: kMuted, fontSize: 12),
+                  ),
+                  Text(
+                    '${(_progress * 100).toInt()}%',
+                    style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
               const SizedBox(height: 8),
-              Text('${(_progress * 100).toInt()}% uploaded...', textAlign: TextAlign.center, style: const TextStyle(color: kMuted)),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: LinearProgressIndicator(
+                  value: _progress,
+                  minHeight: 10,
+                  backgroundColor: kBorder,
+                  valueColor: AlwaysStoppedAnimation<Color>(
+                    _progress >= 1.0 ? Colors.green : kAccent,
+                  ),
+                ),
+              ),
               const SizedBox(height: 16),
             ],
+
+            // ── publish button ────────────────────────────────────────────────
             OfgPrimaryButton(
-              label: 'Publish',
-              onTap: _publish,
+              label: _uploading ? 'Uploading…' : 'Publish',
+              onTap: _uploading ? null : () => _publish(),
               loading: _uploading,
             ),
           ],

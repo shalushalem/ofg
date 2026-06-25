@@ -204,8 +204,8 @@ class ApiClient {
       final length = await file.length();
       
       final request = http.StreamedRequest('PUT', uri)
-        ..headers['Content-Type'] = contentType
-        ..headers['Content-Length'] = length.toString();
+        ..contentLength = length
+        ..headers['Content-Type'] = contentType;
 
       // Stream the file chunk by chunk to prevent OOM crashes
       file.openRead().listen(
@@ -233,6 +233,61 @@ class ApiClient {
       throw const ApiException('Upload timed out. Check your connection.');
     }
   }
+
+  /// Upload a file via the Railway proxy server → Railway uploads to R2.
+  /// Use this instead of [streamedUpload] on mobile — direct phone→R2
+  /// connections fail on some Indian ISPs (errno 103 ECONNABORTED).
+  Future<Map<String, dynamic>> uploadViaProxy(
+    File file,
+    String filename,
+    String contentType, {
+    String type = 'video',
+    void Function(double progress)? onProgress,
+  }) async {
+    try {
+      final fileLength = await file.length();
+      
+      // Using native dart:io HttpClient to completely avoid http package memory limits
+      // This streams data chunk-by-chunk directly from storage into the network socket.
+      final client = HttpClient();
+      client.connectionTimeout = const Duration(minutes: 60);
+      
+      final request = await client.postUrl(_uri('/upload/proxy'));
+      request.headers.set('Authorization', 'Bearer ${token ?? ""}');
+      request.headers.set('Content-Type', contentType);
+      request.headers.set('X-Filename', filename);
+      request.headers.set('X-Upload-Type', type);
+      request.contentLength = fileLength;
+      
+      int bytesSent = 0;
+      final stream = file.openRead().map((chunk) {
+        bytesSent += chunk.length;
+        if (fileLength > 0) {
+          onProgress?.call(bytesSent / fileLength);
+        }
+        return chunk;
+      });
+      
+      await request.addStream(stream);
+      final response = await request.close();
+      
+      final body = await response.transform(utf8.decoder).join();
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        return jsonDecode(body) as Map<String, dynamic>;
+      }
+      throw ApiException('Upload failed (${response.statusCode}): $body',
+          statusCode: response.statusCode);
+    } on SocketException catch (e) {
+      throw ApiException('Network error during upload: ${e.message}');
+    } on TimeoutException {
+      throw const ApiException('Upload timed out after 60 minutes.');
+    } catch (e) {
+      if (e is ApiException) rethrow;
+      throw ApiException('Upload failed: $e');
+    }
+  }
+
+
 
   // -------------------------------------------------------------------------
   // Convenience API methods

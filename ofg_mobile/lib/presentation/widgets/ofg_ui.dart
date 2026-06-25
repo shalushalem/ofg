@@ -5,7 +5,7 @@ import '../theme/ofg_theme.dart';
 // ─── Primary Button ────────────────────────────────────────────────────────────
 class OfgPrimaryButton extends StatelessWidget {
   final String label;
-  final VoidCallback onTap;
+  final VoidCallback? onTap;
   final bool loading;
 
   const OfgPrimaryButton({

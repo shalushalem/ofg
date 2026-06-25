@@ -53,6 +53,7 @@ class OfgUser {
   final String subscription;
   final bool isVerified;
   final bool isAdmin;
+  final String dob;
 
   const OfgUser({
     required this.id,
@@ -64,6 +65,7 @@ class OfgUser {
     required this.subscription,
     required this.isVerified,
     required this.isAdmin,
+    required this.dob,
   });
 
   factory OfgUser.fromJson(Map<String, dynamic> json) {
@@ -81,6 +83,7 @@ class OfgUser {
       subscription: _asStr(m['subscription'] ?? m['subscriptionTier'] ?? 'free'),
       isVerified: _asBool(m['isVerified'] ?? m['verified']),
       isAdmin: _asBool(m['isAdmin'] ?? m['admin']),
+      dob: _asStr(m['dob']),
     );
   }
 
@@ -94,6 +97,7 @@ class OfgUser {
         'subscription': subscription,
         'isVerified': isVerified,
         'isAdmin': isAdmin,
+        'dob': dob,
       };
 
   String toJsonString() => jsonEncode(toJson());
@@ -108,6 +112,7 @@ class OfgUser {
     String? subscription,
     bool? isVerified,
     bool? isAdmin,
+    String? dob,
   }) {
     return OfgUser(
       id: id ?? this.id,
@@ -119,6 +124,7 @@ class OfgUser {
       subscription: subscription ?? this.subscription,
       isVerified: isVerified ?? this.isVerified,
       isAdmin: isAdmin ?? this.isAdmin,
+      dob: dob ?? this.dob,
     );
   }
 

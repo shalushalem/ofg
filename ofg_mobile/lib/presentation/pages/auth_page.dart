@@ -268,6 +268,7 @@ class _AuthPageState extends ConsumerState<AuthPage> {
           ),
         ),
       ),
+    ),
     );
   }
 }
