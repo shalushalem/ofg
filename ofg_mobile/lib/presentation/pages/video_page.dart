@@ -26,10 +26,6 @@ class VideoPage extends ConsumerStatefulWidget {
 }
 
 class _VideoPageState extends ConsumerState<VideoPage> {
-  late bool _liked;
-  late bool _saved;
-  late bool _following;
-  late int _likeCount;
   bool _descExpanded = false;
   final _commentController = TextEditingController();
   bool _isPostingComment = false;
@@ -37,10 +33,6 @@ class _VideoPageState extends ConsumerState<VideoPage> {
   @override
   void initState() {
     super.initState();
-    _liked = widget.video.liked;
-    _saved = widget.video.saved;
-    _following = widget.video.following;
-    _likeCount = widget.video.likes;
 
     // Report watch after 5 seconds
     Future.delayed(const Duration(seconds: 5), () {
@@ -61,23 +53,19 @@ class _VideoPageState extends ConsumerState<VideoPage> {
   }
 
   Future<void> _toggleLike() async {
-    final prevLiked = _liked;
-    setState(() {
-      _liked = !_liked;
-      _likeCount += _liked ? 1 : -1;
-    });
+    final isLiked = ref.read(globalLikedProvider)[widget.video.id] ?? widget.video.liked;
+    final currentLikes = ref.read(globalLikeCountProvider)[widget.video.id] ?? widget.video.likes;
+    
+    ref.read(globalLikedProvider.notifier).update((s) => {...s, widget.video.id: !isLiked});
+    ref.read(globalLikeCountProvider.notifier).update((s) => {...s, widget.video.id: currentLikes + (isLiked ? -1 : 1)});
 
     try {
       final res = await ref.read(apiClientProvider).post('/videos/${widget.video.id}/like', {});
-      setState(() {
-        _liked = res['liked'] as bool? ?? _liked;
-        _likeCount = res['likeCount'] as int? ?? _likeCount;
-      });
+      ref.read(globalLikedProvider.notifier).update((s) => {...s, widget.video.id: res['liked'] as bool? ?? s[widget.video.id]!});
+      ref.read(globalLikeCountProvider.notifier).update((s) => {...s, widget.video.id: res['likeCount'] as int? ?? s[widget.video.id]!});
     } catch (e) {
-      setState(() {
-        _liked = prevLiked;
-        _likeCount += _liked ? 1 : -1;
-      });
+      ref.read(globalLikedProvider.notifier).update((s) => {...s, widget.video.id: isLiked});
+      ref.read(globalLikeCountProvider.notifier).update((s) => {...s, widget.video.id: currentLikes});
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Failed to like video')),
       );
@@ -85,24 +73,24 @@ class _VideoPageState extends ConsumerState<VideoPage> {
   }
 
   Future<void> _toggleSave() async {
-    final prevSaved = _saved;
-    setState(() => _saved = !_saved);
+    final isSaved = ref.read(globalSavedProvider)[widget.video.id] ?? widget.video.saved;
+    ref.read(globalSavedProvider.notifier).update((s) => {...s, widget.video.id: !isSaved});
     try {
       final res = await ref.read(apiClientProvider).post('/videos/${widget.video.id}/save', {});
-      setState(() => _saved = res['saved'] as bool? ?? _saved);
+      ref.read(globalSavedProvider.notifier).update((s) => {...s, widget.video.id: res['saved'] as bool? ?? s[widget.video.id]!});
     } catch (e) {
-      setState(() => _saved = prevSaved);
+      ref.read(globalSavedProvider.notifier).update((s) => {...s, widget.video.id: isSaved});
     }
   }
 
   Future<void> _toggleFollow() async {
-    final prevFollowing = _following;
-    setState(() => _following = !_following);
+    final isFollowing = ref.read(globalFollowingProvider)[widget.video.creatorId] ?? widget.video.following;
+    ref.read(globalFollowingProvider.notifier).update((s) => {...s, widget.video.creatorId: !isFollowing});
     try {
       final res = await ref.read(apiClientProvider).post('/follow/${widget.video.creatorId}', {});
-      setState(() => _following = res['following'] as bool? ?? _following);
+      ref.read(globalFollowingProvider.notifier).update((s) => {...s, widget.video.creatorId: res['following'] as bool? ?? s[widget.video.creatorId]!});
     } catch (e) {
-      setState(() => _following = prevFollowing);
+      ref.read(globalFollowingProvider.notifier).update((s) => {...s, widget.video.creatorId: isFollowing});
     }
   }
 
@@ -133,6 +121,16 @@ class _VideoPageState extends ConsumerState<VideoPage> {
 
   @override
   Widget build(BuildContext context) {
+    final likedMap = ref.watch(globalLikedProvider);
+    final savedMap = ref.watch(globalSavedProvider);
+    final likeCountMap = ref.watch(globalLikeCountProvider);
+    final followingMap = ref.watch(globalFollowingProvider);
+
+    final isLiked = likedMap[widget.video.id] ?? widget.video.liked;
+    final isSaved = savedMap[widget.video.id] ?? widget.video.saved;
+    final likeCount = likeCountMap[widget.video.id] ?? widget.video.likes;
+    final isFollowing = followingMap[widget.video.creatorId] ?? widget.video.following;
+
     return Scaffold(
       backgroundColor: kBg,
       body: SafeArea(
@@ -149,17 +147,11 @@ class _VideoPageState extends ConsumerState<VideoPage> {
                   ),
                 ),
                 Positioned(
-                  top: 8,
-                  left: 8,
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: Colors.black54,
-                      shape: BoxShape.circle,
-                    ),
-                    child: IconButton(
-                      icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 30),
-                      onPressed: widget.onBack,
-                    ),
+                  top: 16,
+                  left: 16,
+                  child: IconButton(
+                    icon: const Icon(Icons.arrow_back, color: Colors.white, size: 28),
+                    onPressed: widget.onBack,
                   ),
                 ),
               ],
@@ -198,17 +190,17 @@ class _VideoPageState extends ConsumerState<VideoPage> {
                       child: Row(
                         children: [
                           _ActionChip(
-                            icon: _liked ? Icons.favorite : Icons.favorite_border,
-                            label: _likeCount.toString(),
-                            isActive: _liked,
+                            icon: isLiked ? Icons.favorite : Icons.favorite_border,
+                            label: likeCount.toString(),
+                            isActive: isLiked,
                             onTap: _toggleLike,
                             activeColor: kAccent,
                           ),
                           const SizedBox(width: 12),
                           _ActionChip(
-                            icon: _saved ? Icons.bookmark : Icons.bookmark_border,
+                            icon: isSaved ? Icons.bookmark : Icons.bookmark_border,
                             label: 'Save',
-                            isActive: _saved,
+                            isActive: isSaved,
                             onTap: _toggleSave,
                             activeColor: Colors.white,
                           ),
@@ -267,11 +259,11 @@ class _VideoPageState extends ConsumerState<VideoPage> {
                           FilledButton(
                             onPressed: _toggleFollow,
                             style: FilledButton.styleFrom(
-                              backgroundColor: _following ? kPanel2 : Colors.white,
-                              foregroundColor: _following ? Colors.white : Colors.black,
+                              backgroundColor: isFollowing ? kPanel2 : Colors.white,
+                              foregroundColor: isFollowing ? Colors.white : Colors.black,
                               padding: const EdgeInsets.symmetric(horizontal: 16),
                             ),
-                            child: Text(_following ? 'Following' : 'Follow'),
+                            child: Text(isFollowing ? 'Following' : 'Follow'),
                           ),
                           const SizedBox(width: 8),
                           // Donate button — shown for other creators' videos

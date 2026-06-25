@@ -19,47 +19,45 @@ class ShortsPage extends ConsumerStatefulWidget {
 
 class _ShortsPageState extends ConsumerState<ShortsPage> {
   int _currentIndex = 0;
-  final Map<String, bool> _likedMap = {};
-  final Map<String, bool> _savedMap = {};
-  final Map<String, int> _likeCountMap = {};
 
   Future<void> _toggleLike(OfgVideo video) async {
-    final isLiked = _likedMap[video.id] ?? video.liked;
-    setState(() {
-      _likedMap[video.id] = !isLiked;
-      _likeCountMap[video.id] = (_likeCountMap[video.id] ?? video.likes) + (isLiked ? -1 : 1);
-    });
+    final isLiked = ref.read(globalLikedProvider)[video.id] ?? video.liked;
+    final currentLikes = ref.read(globalLikeCountProvider)[video.id] ?? video.likes;
+    
+    ref.read(globalLikedProvider.notifier).update((s) => {...s, video.id: !isLiked});
+    ref.read(globalLikeCountProvider.notifier).update((s) => {...s, video.id: currentLikes + (isLiked ? -1 : 1)});
 
     try {
       final res = await ref.read(apiClientProvider).post('/videos/${video.id}/like', {});
-      setState(() {
-        _likedMap[video.id] = res['liked'] as bool? ?? _likedMap[video.id]!;
-        _likeCountMap[video.id] = res['likeCount'] as int? ?? _likeCountMap[video.id]!;
-      });
+      ref.read(globalLikedProvider.notifier).update((s) => {...s, video.id: res['liked'] as bool? ?? s[video.id]!});
+      ref.read(globalLikeCountProvider.notifier).update((s) => {...s, video.id: res['likeCount'] as int? ?? s[video.id]!});
     } catch (e) {
-      // Revert on error
-      setState(() {
-        _likedMap[video.id] = isLiked;
-        _likeCountMap[video.id] = (_likeCountMap[video.id] ?? video.likes) + (isLiked ? 1 : -1);
-      });
+      ref.read(globalLikedProvider.notifier).update((s) => {...s, video.id: isLiked});
+      ref.read(globalLikeCountProvider.notifier).update((s) => {...s, video.id: currentLikes});
     }
   }
 
   Future<void> _toggleSave(OfgVideo video) async {
-    final isSaved = _savedMap[video.id] ?? video.saved;
-    setState(() {
-      _savedMap[video.id] = !isSaved;
-    });
+    final isSaved = ref.read(globalSavedProvider)[video.id] ?? video.saved;
+    ref.read(globalSavedProvider.notifier).update((s) => {...s, video.id: !isSaved});
 
     try {
       final res = await ref.read(apiClientProvider).post('/videos/${video.id}/save', {});
-      setState(() {
-        _savedMap[video.id] = res['saved'] as bool? ?? _savedMap[video.id]!;
-      });
+      ref.read(globalSavedProvider.notifier).update((s) => {...s, video.id: res['saved'] as bool? ?? s[video.id]!});
     } catch (e) {
-      setState(() {
-        _savedMap[video.id] = isSaved;
-      });
+      ref.read(globalSavedProvider.notifier).update((s) => {...s, video.id: isSaved});
+    }
+  }
+
+  Future<void> _toggleFollow(OfgVideo video) async {
+    final isFollowing = ref.read(globalFollowingProvider)[video.creatorId] ?? video.following;
+    ref.read(globalFollowingProvider.notifier).update((s) => {...s, video.creatorId: !isFollowing});
+
+    try {
+      final res = await ref.read(apiClientProvider).post('/follow/${video.creatorId}', {});
+      ref.read(globalFollowingProvider.notifier).update((s) => {...s, video.creatorId: res['following'] as bool? ?? s[video.creatorId]!});
+    } catch (e) {
+      ref.read(globalFollowingProvider.notifier).update((s) => {...s, video.creatorId: isFollowing});
     }
   }
 
@@ -105,9 +103,15 @@ class _ShortsPageState extends ConsumerState<ShortsPage> {
                 },
                 itemBuilder: (context, index) {
                   final video = shorts[index];
-                  final isLiked = _likedMap[video.id] ?? video.liked;
-                  final isSaved = _savedMap[video.id] ?? video.saved;
-                  final likeCount = _likeCountMap[video.id] ?? video.likes;
+                  final likedMap = ref.watch(globalLikedProvider);
+                  final savedMap = ref.watch(globalSavedProvider);
+                  final likeCountMap = ref.watch(globalLikeCountProvider);
+                  final followingMap = ref.watch(globalFollowingProvider);
+
+                  final isLiked = likedMap[video.id] ?? video.liked;
+                  final isSaved = savedMap[video.id] ?? video.saved;
+                  final likeCount = likeCountMap[video.id] ?? video.likes;
+                  final isFollowing = followingMap[video.creatorId] ?? video.following;
 
                   return Stack(
                     fit: StackFit.expand,
@@ -144,13 +148,24 @@ class _ShortsPageState extends ConsumerState<ShortsPage> {
                                   ),
                                 ),
                                 const SizedBox(width: 12),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                                  decoration: BoxDecoration(
-                                    border: Border.all(color: Colors.white),
-                                    borderRadius: BorderRadius.circular(4),
+                                InkWell(
+                                  onTap: () => _toggleFollow(video),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                    decoration: BoxDecoration(
+                                      color: isFollowing ? Colors.transparent : Colors.white,
+                                      border: Border.all(color: Colors.white),
+                                      borderRadius: BorderRadius.circular(4),
+                                    ),
+                                    child: Text(
+                                      isFollowing ? 'Following' : 'Subscribe',
+                                      style: TextStyle(
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                        color: isFollowing ? Colors.white : Colors.black,
+                                      ),
+                                    ),
                                   ),
-                                  child: const Text('Subscribe', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
                                 ),
                               ],
                             ),
@@ -233,14 +248,18 @@ class _ShortsPageState extends ConsumerState<ShortsPage> {
   Widget _buildActionButton({required IconData icon, required String label, required VoidCallback onTap, Color color = Colors.white}) {
     return GestureDetector(
       onTap: onTap,
-      child: Column(
-        children: [
-          Icon(icon, color: color, size: 32),
-          if (label.isNotEmpty) ...[
-            const SizedBox(height: 4),
-            Text(label, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
-          ]
-        ],
+      behavior: HitTestBehavior.opaque,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Column(
+          children: [
+            Icon(icon, color: color, size: 32),
+            if (label.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(label, style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+            ]
+          ],
+        ),
       ),
     );
   }

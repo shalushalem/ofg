@@ -1,0 +1,85 @@
+def video_to_dict(row, liked=False, saved=False, following=False) -> dict:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "description": row["description"] or "",
+        "creator": row["creator_name"],
+        "creatorId": row["creator_id"],
+        "creatorAvatar": row["avatar_url"] if row["avatar_url"] else "",
+        "creatorVerified": bool(row["is_verified"] if row["is_verified"] is not None else 0),
+        "category": row["category"],
+        "duration": row["duration"] or "0:00",
+        "views": row["views"] or 0,
+        "likes": row["like_count"] or 0,
+        "comments": row["comment_count"] or 0,
+        "shares": row["share_count"] or 0,
+        "isShort": bool(row["is_short"]),
+        "isLive": bool(row["is_live"]),
+        "isFeatured": bool(row["is_featured"] if row["is_featured"] is not None else 0),
+        "progress": row["progress"] if row["progress"] is not None else 0,
+        "liked": liked,
+        "saved": saved,
+        "following": following,
+        "mediaUrl": row["media_url"] or "",
+        "thumbnailUrl": row["thumbnail_url"] or "",
+        "createdAt": row["created_at"],
+        "label": f"{row['category']} {'shorts' if row['is_short'] else 'video'}",
+        "meta": f"{row['creator_name']} ΓÇó {format_views(row['views'] or 0)} views",
+    }
+
+def user_to_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "handle": row["handle"],
+        "bio": row["bio"] or "",
+        "avatarUrl": row["avatar_url"] or "",
+        "subscription": row["subscription"] or "Free",
+        "isVerified": bool(row["is_verified"]),
+        "isAdmin": bool(row["is_admin"]),
+    }
+
+def comment_to_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "videoId": row["video_id"],
+        "userId": row["user_id"],
+        "userName": row["user_name"],
+        "userHandle": row["user_handle"],
+        "content": row["content"],
+        "likeCount": row["like_count"] or 0,
+        "createdAt": row["created_at"],
+    }
+
+def notification_to_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "userId": row["user_id"],
+        "type": row["type"],
+        "fromUserId": row["from_user_id"] or "",
+        "fromUserName": row["from_user_name"] or "",
+        "videoId": row["video_id"] or "",
+        "message": row["message"],
+        "isRead": bool(row["is_read"]),
+        "createdAt": row["created_at"],
+    }
+
+def report_to_dict(row) -> dict:
+    return {
+        "id": row["id"],
+        "reporterId": row["reporter_id"],
+        "type": row["type"],
+        "targetId": row["target_id"],
+        "reason": row["reason"],
+        "status": row["status"],
+        "createdAt": row["created_at"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare R2 pre-signed URL (AWS Signature Version 4)
+# ---------------------------------------------------------------------------
+
+def _hmac_sha256(key: bytes, data: str) -> bytes:
+    return hmac.new(key, data.encode("utf-8"), hashlib.sha256).digest()

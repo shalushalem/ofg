@@ -290,8 +290,19 @@ class _MainLayoutState extends ConsumerState<MainLayout> {
 
   @override
   Widget build(BuildContext context) {
-    return WillPopScope(
-      onWillPop: _onWillPop,
+    return PopScope(
+      canPop: _activeVideo == null && _currentIndex == 0,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        if (_activeVideo != null) {
+          _closeVideo();
+          return;
+        }
+        if (_currentIndex != 0) {
+          setState(() => _currentIndex = 0);
+          return;
+        }
+      },
       child: Scaffold(
         backgroundColor: kBg,
       body: Stack(

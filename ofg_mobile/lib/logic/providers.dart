@@ -101,7 +101,15 @@ final shortsProvider = FutureProvider<List<OfgVideo>>((ref) async {
 final searchQueryProvider = StateProvider<String>((ref) => '');
 
 // ---------------------------------------------------------------------------
-// 7. Video Comments (family provider)
+// 7. Global Interaction State Caches (Likes, Saves, Follows)
+// ---------------------------------------------------------------------------
+final globalLikedProvider = StateProvider<Map<String, bool>>((ref) => {});
+final globalSavedProvider = StateProvider<Map<String, bool>>((ref) => {});
+final globalLikeCountProvider = StateProvider<Map<String, int>>((ref) => {});
+final globalFollowingProvider = StateProvider<Map<String, bool>>((ref) => {});
+
+// ---------------------------------------------------------------------------
+// 8. Video Comments (family provider)
 // ---------------------------------------------------------------------------
 final videoCommentsProvider =
     FutureProvider.family<List<OfgComment>, String>((ref, videoId) async {

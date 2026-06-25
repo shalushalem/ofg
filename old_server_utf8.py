@@ -1,4 +1,4 @@
-"""
+﻿"""
 OFG Connects - Christian Media Streaming Backend
 Python 3.11+ stdlib HTTP server with SQLite + Cloudflare R2
 """
@@ -11,10 +11,10 @@ import json
 import os
 import re
 import secrets
-import psycopg2
-import psycopg2.extras
+import sqlite3
 import urllib.parse
 import urllib.request
+import hmac
 import base64
 import datetime
 from datetime import datetime, timezone, timedelta
@@ -88,7 +88,6 @@ CREATE TABLE IF NOT EXISTS users (
     is_banned INTEGER DEFAULT 0,
     follower_count INTEGER DEFAULT 0,
     following_count INTEGER DEFAULT 0,
-    dob TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
 
@@ -110,7 +109,6 @@ CREATE TABLE IF NOT EXISTS videos (
     like_count INTEGER DEFAULT 0,
     comment_count INTEGER DEFAULT 0,
     share_count INTEGER DEFAULT 0,
-    save_count INTEGER DEFAULT 0,
     watch_time_total REAL DEFAULT 0,
     thumbnail_url TEXT DEFAULT '',
     media_url TEXT DEFAULT '',
@@ -259,35 +257,12 @@ CREATE INDEX IF NOT EXISTS idx_payouts_status ON payouts(status);
 """
 
 
-
-class DBWrapper:
-    def __init__(self, conn):
-        self.conn = conn
-
-    def execute(self, sql: str, params: tuple | list = ()):
-        sql_pg = sql.replace("?", "%s")
-        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        try:
-            cur.execute(sql_pg, params)
-        except Exception as e:
-            print(f"[DB ERROR] {e} -> {sql_pg} | params: {params}")
-            self.conn.rollback()
-            raise
-        return cur
-
-    def commit(self):
-        self.conn.commit()
-
-    def close(self):
-        self.conn.close()
-
-def get_db() -> DBWrapper:
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        raise Exception("DATABASE_URL environment variable is missing")
-    conn = psycopg2.connect(db_url)
-    conn.autocommit = False
-    return DBWrapper(conn)
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
 def init_db() -> None:
@@ -298,37 +273,19 @@ def init_db() -> None:
             if stmt:
                 try:
                     conn.execute(stmt)
-                except psycopg2.Error:
+                except sqlite3.OperationalError:
                     pass
         conn.commit()
         _migrate_db(conn)
-        _seed_config(conn)
         _seed_users(conn)
     finally:
         conn.close()
 
-def _seed_config(conn: DBWrapper) -> None:
-    defaults = {
-        "feed_completion": 25.0,
-        "feed_category": 25.0,
-        "feed_following": 15.0,
-        "feed_likes": 8.0,
-        "feed_shares": 8.0,
-        "feed_saves": 5.0,
-        "feed_freshness": 8.0,
-        "feed_age": 4.0,
-        "feed_exploration": 2.0
-    }
-    for k, v in defaults.items():
-        conn.execute("INSERT INTO app_config (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", (k, v))
-    conn.commit()
 
-
-def _migrate_db(conn: DBWrapper) -> None:
+def _migrate_db(conn: sqlite3.Connection) -> None:
     """Safely add new algorithm columns to existing databases."""
     migrations = [
         "ALTER TABLE videos ADD COLUMN impressions INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN dob TEXT DEFAULT ''",
         "ALTER TABLE videos ADD COLUMN avg_completion_rate REAL DEFAULT 0",
         "ALTER TABLE videos ADD COLUMN recent_views INTEGER DEFAULT 0",
         "ALTER TABLE videos ADD COLUMN recent_views_updated TEXT DEFAULT ''",
@@ -340,28 +297,6 @@ def _migrate_db(conn: DBWrapper) -> None:
             PRIMARY KEY(user_id, video_id)
         )""",
         "CREATE INDEX IF NOT EXISTS idx_video_skips_user ON video_skips(user_id)",
-        "ALTER TABLE videos ADD COLUMN save_count INTEGER DEFAULT 0",
-        """CREATE TABLE IF NOT EXISTS video_daily_stats (
-            video_id TEXT NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-            stat_date TEXT NOT NULL,
-            views INTEGER DEFAULT 0,
-            likes INTEGER DEFAULT 0,
-            shares INTEGER DEFAULT 0,
-            comments INTEGER DEFAULT 0,
-            saves INTEGER DEFAULT 0,
-            PRIMARY KEY(video_id, stat_date)
-        )""",
-        "CREATE INDEX IF NOT EXISTS idx_video_daily_stats_date ON video_daily_stats(stat_date)",
-        """CREATE TABLE IF NOT EXISTS user_blocks (
-            blocker_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            blocked_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            created_at TEXT NOT NULL,
-            PRIMARY KEY(blocker_id, blocked_id)
-        )""",
-        """CREATE TABLE IF NOT EXISTS app_config (
-            key TEXT PRIMARY KEY,
-            value REAL NOT NULL
-        )""",
         # Donation system tables
         """CREATE TABLE IF NOT EXISTS creator_wallets (
             creator_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -408,13 +343,13 @@ def _migrate_db(conn: DBWrapper) -> None:
     for m in migrations:
         try:
             conn.execute(m)
-        except psycopg2.Error:
-            pass  # Column/table already exists — safe to ignore
+        except sqlite3.OperationalError:
+            pass  # Column/table already exists ΓÇö safe to ignore
     conn.commit()
 
 
 
-def _seed_users(conn: DBWrapper) -> None:
+def _seed_users(conn: sqlite3.Connection) -> None:
     count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     if count > 0:
         return
@@ -503,10 +438,8 @@ def format_views(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Algorithm V5 — Production Recommendation Engine
+# Algorithm v2 ΓÇö YouTube-inspired multi-signal scoring
 # ---------------------------------------------------------------------------
-import random
-from datetime import timedelta
 
 def _age_hours(created_at_iso: str) -> float:
     try:
@@ -515,31 +448,112 @@ def _age_hours(created_at_iso: str) -> float:
     except Exception:
         return 9999.0
 
-def _get_weights(db) -> dict:
-    weights = {
-        "completion": 25.0,
-        "category": 25.0,
-        "following": 15.0,
-        "likes": 8.0,
-        "shares": 8.0,
-        "saves": 5.0,
-        "freshness": 8.0,
-        "age": 4.0,
-        "exploration": 2.0,
-        "trending": 8.0,
-    }
-    try:
-        rows = db.execute("SELECT key, value FROM app_config").fetchall()
-        for r in rows:
-            k = r["key"].replace("feed_", "")
-            if k in weights:
-                weights[k] = float(r["value"])
-    except Exception:
-        pass
-    return weights
+
+def _recency_score(age_hours: float) -> float:
+    """Smooth decay curve instead of step-function."""
+    if age_hours < 6:    return 20.0
+    if age_hours < 24:   return 16.0
+    if age_hours < 72:   return 11.0
+    if age_hours < 168:  return 7.0
+    if age_hours < 720:  return 3.0
+    if age_hours < 2160: return 1.0
+    return 0.0
+
+
+def _ctr_score(views: int, impressions: int) -> float:
+    """Click-through rate signal ΓÇö how often people click when shown this video."""
+    if impressions < 10:
+        return 5.0  # Not enough data ΓÇö neutral prior
+    ctr = min(views / impressions, 1.0)
+    # YouTube target CTR is ~2-10%; we scale to 0-25 pts
+    return min(ctr * 150, 25.0)
+
+
+def _engagement_score(like_count: int, comment_count: int, share_count: int, views: int) -> float:
+    """Weighted engagement rate ΓÇö shares > comments > likes (cost of action)."""
+    # Likes=1, Comments=3 (intent to discuss), Shares=5 (highest intent)
+    weighted = like_count * 1 + comment_count * 3 + share_count * 5
+    rate = weighted / max(views, 1)
+    return min(rate * 50, 30.0)
+
+
+def _completion_score(avg_completion: float) -> float:
+    """Avg completion rate across ALL users for this video ΓÇö signals content quality."""
+    # 0-20 pts. A video watched to 80%+ avg is exceptional.
+    return min(avg_completion * 25, 20.0)
+
+
+def _velocity_score(recent_views: int, total_views: int, age_hours: float) -> float:
+    """Trending signal ΓÇö how fast is this video gaining traction right now?"""
+    if total_views < 1:
+        return 0.0
+    # recent_views = views in last 24h
+    velocity = recent_views / max(total_views, 1)
+    # New videos naturally have high velocity ΓÇö dampen slightly for very new content
+    dampen = min(age_hours / 12, 1.0) if age_hours < 48 else 1.0
+    return min(velocity * 40 * dampen, 20.0)
+
+
+def score_video(
+    row: dict,
+    *,
+    follow_boost: float = 0.0,
+    watch_penalty: float = 0.0,
+    category_score: float = 0.0,
+    collab_boost: float = 0.0,
+    save_boost: float = 0.0,
+) -> float:
+    """Main scoring function ΓÇö combines all signals."""
+    views = row.get("views") or 0
+    impressions = row.get("impressions") or views  # fallback if column missing
+    age_h = _age_hours(row.get("created_at", ""))
+    recent_v = row.get("recent_views") or 0
+    avg_comp = row.get("avg_completion_rate") or 0.0
+
+    # Core signals
+    s_ctr         = _ctr_score(views, impressions)                               # max 25
+    s_engagement  = _engagement_score(
+        row.get("like_count") or 0,
+        row.get("comment_count") or 0,
+        row.get("share_count") or 0,
+        views,
+    )                                                                             # max 30
+    s_completion  = _completion_score(avg_comp)                                  # max 20
+    s_velocity    = _velocity_score(recent_v, views, age_h)                     # max 20
+    s_recency     = _recency_score(age_h)                                       # max 20
+
+    # Personalization signals
+    s_follow      = follow_boost      # +15 if user follows creator
+    s_category    = category_score    # 0-20 based on user affinity
+    s_collab      = collab_boost      # 0-10 collaborative filtering boost
+    s_save        = save_boost        # +5 if user saved similar content
+
+    # Penalty / suppression
+    s_watch       = watch_penalty     # -3 to -20 depending on skip depth
+
+    # Featured override
+    s_featured    = 100.0 if (row.get("is_featured") or 0) else 0.0
+
+    return (s_ctr + s_engagement + s_completion + s_velocity + s_recency
+            + s_follow + s_category + s_collab + s_save + s_watch + s_featured)
+
+
+def _update_recent_views(db, vid_id: str) -> None:
+    """Recalculate recent_views (last 24h) for a video. Called on watch event."""
+    threshold = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    count = db.execute(
+        """SELECT COUNT(*) FROM history
+           WHERE video_id=? AND viewed_at > ?""",
+        (vid_id, threshold),
+    ).fetchone()[0]
+    db.execute(
+        "UPDATE videos SET recent_views=?, recent_views_updated=? WHERE id=?",
+        (count, utcnow(), vid_id),
+    )
+
 
 # ---------------------------------------------------------------------------
-# Dictionary Converters
+# JSON serializers
 # ---------------------------------------------------------------------------
 
 def video_to_dict(row, liked=False, saved=False, following=False) -> dict:
@@ -560,7 +574,7 @@ def video_to_dict(row, liked=False, saved=False, following=False) -> dict:
         "isShort": bool(row["is_short"]),
         "isLive": bool(row["is_live"]),
         "isFeatured": bool(row["is_featured"] if row["is_featured"] is not None else 0),
-        "progress": row["progress"] if "progress" in row and row["progress"] is not None else 0,
+        "progress": row["progress"] if row["progress"] is not None else 0,
         "liked": liked,
         "saved": saved,
         "following": following,
@@ -568,8 +582,9 @@ def video_to_dict(row, liked=False, saved=False, following=False) -> dict:
         "thumbnailUrl": row["thumbnail_url"] or "",
         "createdAt": row["created_at"],
         "label": f"{row['category']} {'shorts' if row['is_short'] else 'video'}",
-        "meta": f"{row['creator_name']} • {format_views(row['views'] or 0)} views",
+        "meta": f"{row['creator_name']} ΓÇó {format_views(row['views'] or 0)} views",
     }
+
 
 def user_to_dict(row) -> dict:
     return {
@@ -584,6 +599,7 @@ def user_to_dict(row) -> dict:
         "isAdmin": bool(row["is_admin"]),
     }
 
+
 def comment_to_dict(row) -> dict:
     return {
         "id": row["id"],
@@ -595,6 +611,7 @@ def comment_to_dict(row) -> dict:
         "likeCount": row["like_count"] or 0,
         "createdAt": row["created_at"],
     }
+
 
 def notification_to_dict(row) -> dict:
     return {
@@ -609,6 +626,7 @@ def notification_to_dict(row) -> dict:
         "createdAt": row["created_at"],
     }
 
+
 def report_to_dict(row) -> dict:
     return {
         "id": row["id"],
@@ -620,12 +638,73 @@ def report_to_dict(row) -> dict:
         "createdAt": row["created_at"],
     }
 
+
+# ---------------------------------------------------------------------------
+# Cloudflare R2 pre-signed URL (AWS Signature Version 4)
+# ---------------------------------------------------------------------------
+
+def _hmac_sha256(key: bytes, data: str) -> bytes:
+    return hmac.new(key, data.encode("utf-8"), hashlib.sha256).digest()
+
+
+def _r2_presign_put(key: str, content_type: str, expires: int = 3600,
+                    bucket: str = None, public_url: str = None) -> str:
+    """Generate a pre-signed PUT URL for R2 using boto3."""
+    if not R2_ENDPOINT or not R2_ACCESS_KEY_ID or not R2_SECRET_ACCESS_KEY:
+        return ""
+
+    target_bucket = bucket or R2_BUCKET_NAME
+
+    try:
+        s3_client = boto3.client('s3',
+            endpoint_url=R2_ENDPOINT,
+            aws_access_key_id=R2_ACCESS_KEY_ID,
+            aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+            config=Config(signature_version='s3v4'),
+            region_name='auto'
+        )
+
+        params = {'Bucket': target_bucket, 'Key': key}
+        # NOTE: Do NOT include ContentType in params ΓÇö if we sign it, the client's
+        # Content-Type header must match byte-perfectly or R2 returns 403.
+        # Leaving it unsigned means the client can set any Content-Type freely.
+
+        return s3_client.generate_presigned_url(
+            ClientMethod='put_object',
+            Params=params,
+            ExpiresIn=expires
+        )
+    except Exception as e:
+        print(f"[OFG ERROR] Presign URL failed: {e}")
+        return ""
+
+
+def r2_public_url(key: str, pub_url: str = None, bucket: str = None) -> str:
+    base = (pub_url or R2_PUBLIC_URL).rstrip("/")
+    if base:
+        return f"{base}/{key}"
+    target_bucket = bucket or R2_BUCKET_NAME
+    if R2_ENDPOINT:
+        return f"{R2_ENDPOINT.rstrip('/')}/{target_bucket}/{key}"
+    return key
+
+
 # ---------------------------------------------------------------------------
 # Feed query helper
 # ---------------------------------------------------------------------------
 
+VIDEO_SELECT = """
+    SELECT v.*,
+           u.avatar_url,
+           u.is_verified
+    FROM videos v
+    JOIN users u ON u.id = v.creator_id
+    WHERE v.is_removed = 0
+"""
+
+
 def _build_feed(
-    db: DBWrapper,
+    db: sqlite3.Connection,
     user=None,
     category: str = "",
     is_short: Optional[bool] = None,
@@ -634,11 +713,13 @@ def _build_feed(
     search_q: str = "",
 ) -> tuple[list[dict], int]:
     """
-    Algorithm v5 — Multi-signal personalized feed.
+    Algorithm v2 ΓÇö YouTube-inspired multi-signal personalized feed.
+    Signals: CTR, engagement quality, completion rate, velocity/trending,
+             recency, follow boost, category affinity, collaborative filtering,
+             adaptive watch penalty, creator diversity.
     """
-    weights = _get_weights(db)
 
-    # ---- 1. Generate Candidate Pool ----
+    # ---- base query ΓÇö fetch all candidates ----
     conditions = ["v.is_removed = 0"]
     params: list = []
 
@@ -657,7 +738,6 @@ def _build_feed(
 
     where = " AND ".join(conditions)
 
-    # Performance: Only fetch top 500 recent or high-view videos as candidates
     sql = f"""
         SELECT v.*,
                u.avatar_url,
@@ -665,243 +745,182 @@ def _build_feed(
         FROM videos v
         JOIN users u ON u.id = v.creator_id
         WHERE {where}
-        ORDER BY v.created_at DESC, v.views DESC
-        LIMIT 500
     """
 
     rows = db.execute(sql, params).fetchall()
+
     if not rows:
         return [], 0
-        
+
+    # ---- Track impressions for CTR signal ----
+    # Every video returned in /feed = 1 impression (server-side CTR)
     vid_ids_in_feed = [r["id"] for r in rows]
+    if vid_ids_in_feed:
+        placeholders = ",".join("?" * len(vid_ids_in_feed))
+        db.execute(
+            f"UPDATE videos SET impressions=impressions+1 WHERE id IN ({placeholders})",
+            vid_ids_in_feed,
+        )
+        db.commit()
 
-    # ---- 2. Personalization context ----
-    uid = user["id"] if user else None
-    user_age = 0
-    history_count = 0
-
+    # ---- Personalization context ----
     followed_ids: set[str] = set()
-    blocked_ids: set[str] = set()
-    watched_completion: dict[str, float] = {}
-    skip_ids: set[str] = set()
-    top_categories: dict[str, float] = {}
+    watched_completion: dict[str, float] = {}   # video_id -> user's personal completion rate
+    skip_ids: set[str] = set()                   # videos user skipped early
+    top_categories: dict[str, float] = {}        # category -> affinity score
     liked_ids: set[str] = set()
     saved_ids: set[str] = set()
+    collab_video_ids: set[str] = set()           # collaborative filtering candidates
 
-    if uid:
-        # Age
-        dob_str = user.get("dob")
-        if dob_str:
-            try:
-                dob = datetime.strptime(dob_str, "%Y-%m-%d").date()
-                today = datetime.now(timezone.utc).date()
-                user_age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
-            except Exception:
-                pass
-
-        # Blocks
-        try:
-            blk = db.execute("SELECT blocked_id FROM user_blocks WHERE blocker_id=?", (uid,)).fetchall()
-            blocked_ids = {r["blocked_id"] for r in blk}
-        except Exception: pass
+    if user:
+        uid = user["id"]
 
         # Follows
         foll = db.execute("SELECT creator_id FROM follows WHERE follower_id=?", (uid,)).fetchall()
         followed_ids = {r["creator_id"] for r in foll}
 
-        # Watch history
-        hist = db.execute("SELECT video_id, completion_rate FROM history WHERE user_id=?", (uid,)).fetchall()
-        history_count = len(hist)
+        # Watch history with completion rates
+        hist = db.execute(
+            "SELECT video_id, completion_rate FROM history WHERE user_id=?", (uid,)
+        ).fetchall()
         for r in hist:
             watched_completion[r["video_id"]] = float(r["completion_rate"] or 0)
 
         # Skips (completion < 15%)
         try:
-            skip_rows = db.execute("SELECT video_id FROM video_skips WHERE user_id=?", (uid,)).fetchall()
+            skip_rows = db.execute(
+                "SELECT video_id FROM video_skips WHERE user_id=?", (uid,)
+            ).fetchall()
             skip_ids = {r["video_id"] for r in skip_rows}
-        except Exception: pass
+        except Exception:
+            pass  # Table may not exist on old DB ΓÇö safe fallback
 
-        # Category affinity
+        # Category affinity ΓÇö weighted by completion + recency
         cat_sql = """
-            SELECT v.category, SUM(h.completion_rate) AS affinity
+            SELECT v.category,
+                   SUM(h.completion_rate * CASE
+                       WHEN h.viewed_at > datetime('now', '-7 days') THEN 2.0
+                       WHEN h.viewed_at > datetime('now', '-30 days') THEN 1.0
+                       ELSE 0.5 END) AS weighted_affinity,
+                   COUNT(*) AS cnt
             FROM history h
             JOIN videos v ON v.id = h.video_id
             WHERE h.user_id = ?
             GROUP BY v.category
+            ORDER BY weighted_affinity DESC
         """
         cat_rows = db.execute(cat_sql, (uid,)).fetchall()
         for cr in cat_rows:
-            top_categories[cr["category"]] = float(cr["affinity"] or 0)
+            top_categories[cr["category"]] = float(cr["weighted_affinity"] or 0)
+
+        # Normalize category affinity to 0-1
         max_affinity = max(top_categories.values(), default=1)
         top_categories = {k: v / max_affinity for k, v in top_categories.items()}
 
         # Likes / Saves
         lk = db.execute("SELECT video_id FROM likes WHERE user_id=?", (uid,)).fetchall()
         liked_ids = {r["video_id"] for r in lk}
+
         sv = db.execute("SELECT video_id FROM saves WHERE user_id=?", (uid,)).fetchall()
         saved_ids = {r["video_id"] for r in sv}
 
-    # ---- 3. Fetch 24h Velocity / Trending Stats ----
-    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    placeholders = ",".join("?" * len(vid_ids_in_feed))
-    stats_rows = []
-    try:
-        stats_rows = db.execute(
-            f"""SELECT video_id, SUM(views) as v_24h, SUM(likes) as l_24h, SUM(shares) as sh_24h, SUM(comments) as c_24h
-                FROM video_daily_stats
-                WHERE video_id IN ({placeholders}) AND stat_date >= ?
-                GROUP BY video_id""",
-            vid_ids_in_feed + [yesterday]
-        ).fetchall()
-    except Exception: pass
-    
-    velocity_map = {}
-    for sr in stats_rows:
-        velocity_map[sr["video_id"]] = (
-            (sr["v_24h"] or 0) * 0.4 +
-            (sr["l_24h"] or 0) * 0.3 +
-            (sr["c_24h"] or 0) * 0.2 +
-            (sr["sh_24h"] or 0) * 0.1
-        )
-    max_velocity = max(velocity_map.values(), default=1) or 1
+        # ---- Collaborative Filtering (lightweight co-watch) ----
+        # Find users who watched the same top-3 videos as this user
+        # Then recommend what they also watched (but this user hasn't seen)
+        top_watched = list(watched_completion.keys())[:3]
+        if top_watched:
+            placeholders = ",".join("?" * len(top_watched))
+            similar_users = db.execute(
+                f"""SELECT DISTINCT h2.user_id FROM history h2
+                    WHERE h2.video_id IN ({placeholders})
+                    AND h2.user_id != ?
+                    AND h2.completion_rate > 0.5
+                    LIMIT 20""",
+                top_watched + [uid],
+            ).fetchall()
+            similar_uids = [r["user_id"] for r in similar_users]
+            if similar_uids:
+                s_ph = ",".join("?" * len(similar_uids))
+                collab_rows = db.execute(
+                    f"""SELECT DISTINCT h.video_id FROM history h
+                        WHERE h.user_id IN ({s_ph})
+                        AND h.video_id NOT IN ({placeholders})
+                        AND h.completion_rate > 0.6""",
+                    similar_uids + top_watched,
+                ).fetchall()
+                collab_video_ids = {r["video_id"] for r in collab_rows}
 
-    # ---- 4. Score each video ----
-    scored = []
+    # ---- Score each video ----
+    scored: list[tuple[float, sqlite3.Row]] = []
+
     for row in rows:
-        vid_id = row["id"]
-        cid = row["creator_id"]
-        
-        if cid in blocked_ids:
-            continue
-
+        vid_id  = row["id"]
         vid_cat = row["category"]
-        views = row["views"] or 0
-        likes = row["like_count"] or 0
-        shares = row["share_count"] or 0
-        saves = row.get("save_count") or 0
-        age_h = _age_hours(row.get("created_at", ""))
-        
-        breakdown = {}
+        creator_id = row["creator_id"]
 
-        # 1. Watch Completion
-        comp_rate = watched_completion.get(vid_id)
-        if comp_rate is None:
-            comp_rate = row.get("avg_completion_rate") or 0.0
-        s_completion = min((comp_rate / 0.8) * weights["completion"], weights["completion"])
-        breakdown["completion"] = s_completion
+        # --- Personalization signals ---
+        follow_boost = 15.0 if creator_id in followed_ids else 0.0
 
-        # 2. Category Affinity
-        s_category = top_categories.get(vid_cat, 0.0) * weights["category"]
-        breakdown["category"] = s_category
-
-        # 3. Following Affinity
-        s_following = weights["following"] if cid in followed_ids else 0.0
-        breakdown["following"] = s_following
-
-        # 4. Likes, Shares, Saves (Engagement Rates)
-        view_denom = max(views, 1)
-        like_rate = min(likes / view_denom / 0.1, 1.0) # 10% like rate = max score
-        s_likes = like_rate * weights["likes"]
-        
-        share_rate = min(shares / view_denom / 0.05, 1.0) # 5% share rate = max score
-        s_shares = share_rate * weights["shares"]
-        
-        save_rate = min(saves / view_denom / 0.05, 1.0)
-        s_saves = save_rate * weights["saves"]
-        breakdown["likes"] = s_likes
-        breakdown["shares"] = s_shares
-        breakdown["saves"] = s_saves
-
-        # 5. Freshness
-        s_freshness = 0.0
-        if age_h < 24: s_freshness = weights["freshness"]
-        elif age_h < 168: s_freshness = weights["freshness"] * 0.5
-        elif age_h < 336: s_freshness = weights["freshness"] * 0.2
-        breakdown["freshness"] = s_freshness
-
-        # 6. Trending (Velocity)
-        vel = velocity_map.get(vid_id, 0.0)
-        s_trending = min((vel / max_velocity) * weights["trending"], weights["trending"])
-        breakdown["trending"] = s_trending
-
-        # 7. Age / Cold Start
-        s_age = 0.0
-        if 0 < user_age <= 15 and vid_cat in ("kids", "youth", "worship"):
-            s_age = weights["age"]
-        elif 16 <= user_age <= 18 and vid_cat in ("youth", "worship", "testimony"):
-            s_age = weights["age"]
-        elif 19 <= user_age <= 25 and vid_cat in ("sermons", "worship", "bible_study", "testimony"):
-            s_age = weights["age"]
-        elif 26 <= user_age <= 40 and vid_cat in ("sermons", "bible_study", "worship"):
-            s_age = weights["age"]
-        elif 41 <= user_age <= 60 and vid_cat in ("sermons", "bible_study", "prayer"):
-            s_age = weights["age"]
-        elif user_age > 60 and vid_cat in ("prayer", "worship", "bible_study"):
-            s_age = weights["age"]
-
-        # Decay age based on history
-        if history_count > 100: s_age *= 0.1
-        elif history_count > 50: s_age *= 0.4
-        elif history_count > 20: s_age *= 0.7
-        breakdown["age"] = s_age
-
-        # 8. Exploration
-        s_explore = 0.0
-        if views < 500: s_explore += weights["exploration"] * 0.5
-        s_explore += random.uniform(0, weights["exploration"] * 0.5)
-        breakdown["exploration"] = s_explore
-
-        # 9. Quality Floor
-        s_quality = 0.0
-        if len(row["title"]) > 5 and row["duration"] != "0:00":
-            s_quality = 2.0
-        breakdown["quality"] = s_quality
-
-        # 10. Negative Feedback
-        s_penalty = 0.0
+        # Adaptive watch penalty based on how much user skipped
         if vid_id in skip_ids:
-            s_penalty = -15.0
-        breakdown["penalty"] = s_penalty
+            watch_penalty = -20.0  # User actively skipped early ΓÇö strong suppress
+        elif vid_id in watched_completion:
+            cr = watched_completion[vid_id]
+            if cr >= 0.85:
+                watch_penalty = -2.0   # Watched nearly all ΓÇö mild penalty (may rewatch)
+            elif cr >= 0.5:
+                watch_penalty = -6.0   # Watched half
+            elif cr >= 0.2:
+                watch_penalty = -12.0  # Watched a little
+            else:
+                watch_penalty = -18.0  # Barely watched ΓÇö suppress heavily
+        else:
+            watch_penalty = 0.0
 
-        total_score = sum(breakdown.values())
-        
-        # Featured override
-        if row.get("is_featured"):
-            total_score += 100.0
+        # Category affinity (0ΓÇô20 pts)
+        category_score = top_categories.get(vid_cat, 0) * 20
 
-        scored.append((total_score, dict(row), breakdown))
+        # Collaborative filtering boost (0ΓÇô10 pts)
+        collab_boost = 8.0 if vid_id in collab_video_ids else 0.0
+
+        # Save signal ΓÇö user saved similar category content
+        save_boost = 3.0 if vid_id in saved_ids else 0.0
+
+        sc = score_video(
+            dict(row),
+            follow_boost=follow_boost,
+            watch_penalty=watch_penalty,
+            category_score=category_score,
+            collab_boost=collab_boost,
+            save_boost=save_boost,
+        )
+
+        scored.append((sc, row))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     total = len(scored)
 
-    # ---- 5. Creator Diversity & Paging ----
+    # ---- Creator Diversity: max 3 videos per creator per page ----
     start = page * limit
+    all_sorted = scored  # already sorted
     creator_count: dict[str, int] = {}
-    paged = []
-    
-    for score, row, brk in scored:
+    paged: list[tuple[float, sqlite3.Row]] = []
+    skipped = 0
+
+    for score, row in all_sorted:
         if len(paged) >= limit + start:
             break
         cid = row["creator_id"]
-        cc = creator_count.get(cid, 0)
-        
-        # Diversity penalty
-        if cc > 0:
-            score -= 15.0 * cc
-            brk["diversity_penalty"] = -15.0 * cc
-            
-        creator_count[cid] = cc + 1
-        paged.append((score, row, brk))
+        creator_count[cid] = creator_count.get(cid, 0) + 1
+        if creator_count[cid] > 3:  # Max 3 per creator per feed request
+            continue
+        paged.append((score, row))
 
-    # Resort after diversity penalty for just this page
-    # Not perfect globally but works for MVP paging
-    paged.sort(key=lambda x: x[0], reverse=True)
     paged = paged[start: start + limit]
 
-    # ---- 6. Build result items ----
+    # ---- Build result items ----
     items = []
-    for score, row, brk in paged:
+    for _, row in paged:
         vid_id    = row["id"]
         liked     = vid_id in liked_ids
         saved     = vid_id in saved_ids
@@ -918,11 +937,13 @@ def _build_feed(
 
         d = video_to_dict(row, liked=liked, saved=saved, following=following)
         d["progress"] = prog
-        d["_scoreBreakdown"] = {k: round(v, 2) for k, v in brk.items()}
-        d["_totalScore"] = round(score, 2)
+        # Surface algorithm confidence for debugging (remove in prod)
+        # d["_score"] = round(score, 2)
         items.append(d)
 
     return items, total
+
+
 # ---------------------------------------------------------------------------
 # HTTP Handler
 # ---------------------------------------------------------------------------
@@ -973,7 +994,7 @@ class Handler(BaseHTTPRequestHandler):
             return auth[7:].strip()
         return None
 
-    def _user(self, db: DBWrapper):
+    def _user(self, db: sqlite3.Connection):
         token = self._token()
         if not token:
             return None
@@ -984,14 +1005,14 @@ class Handler(BaseHTTPRequestHandler):
             "SELECT * FROM users WHERE id=? AND is_banned=0", (sess["user_id"],)
         ).fetchone()
 
-    def _require_user(self, db: DBWrapper):
+    def _require_user(self, db: sqlite3.Connection):
         user = self._user(db)
         if not user:
             self._error("Unauthorized", 401)
             return None
         return user
 
-    def _require_admin(self, db: DBWrapper) -> bool:
+    def _require_admin(self, db: sqlite3.Connection) -> bool:
         secret = self.headers.get("X-Admin-Secret", "")
         if secret == ADMIN_SECRET:
             return True
@@ -1020,7 +1041,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             db.close()
 
-    def _route_get(self, db: DBWrapper):
+    def _route_get(self, db: sqlite3.Connection):
         path = self._path()
         qs   = self._qs()
 
@@ -1283,7 +1304,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             db.close()
 
-    def _route_post(self, db: DBWrapper):
+    def _route_post(self, db: sqlite3.Connection):
         path = self._path()
 
         if path == "/auth/register":
@@ -1334,14 +1355,6 @@ class Handler(BaseHTTPRequestHandler):
             if not user:
                 return
             self._handle_upload_init(db, user)
-            return
-
-        # /upload/proxy  — phone streams file here; server uploads to R2
-        if path == "/upload/proxy":
-            user = self._require_user(db)
-            if not user:
-                return
-            self._handle_upload_proxy(db, user)
             return
 
         # /upload
@@ -1495,31 +1508,20 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Auth ----
 
-    def _handle_register(self, db: DBWrapper):
+    def _handle_register(self, db: sqlite3.Connection):
         body = self._body()
         name  = (body.get("name") or "").strip()
         email = (body.get("email") or "").strip().lower()
         password = body.get("password") or ""
-        dob = (body.get("dob") or "").strip()
 
-        if not name or not email or not password or not dob:
-            self._error("name, email, password, and date of birth are required")
+        if not name or not email or not password:
+            self._error("name, email, and password are required")
             return
         if not validate_email(email):
             self._error("Invalid email format")
             return
         if len(password) < 6:
             self._error("Password must be at least 6 characters")
-            return
-            
-        try:
-            dob_date = datetime.strptime(dob, "%Y-%m-%d").date()
-            age = (datetime.now(timezone.utc).date() - dob_date).days / 365.25
-            if age < 13:
-                self._error("You must be at least 13 years old to use this app.")
-                return
-        except ValueError:
-            self._error("Invalid Date of Birth format. Use YYYY-MM-DD")
             return
 
         existing = db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone()
@@ -1536,9 +1538,9 @@ class Handler(BaseHTTPRequestHandler):
         db.execute(
             """INSERT INTO users (id, name, email, handle, password_hash, salt,
                bio, avatar_url, subscription, is_verified, is_admin, is_banned,
-               follower_count, following_count, dob, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (uid, name, email, handle, phash, salt, "", "", "Free", 0, 0, 0, 0, 0, dob, now),
+               follower_count, following_count, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (uid, name, email, handle, phash, salt, "", "", "Free", 0, 0, 0, 0, 0, now),
         )
 
         token = gen_token()
@@ -1551,7 +1553,7 @@ class Handler(BaseHTTPRequestHandler):
         user_row = db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         self._json({"token": token, "user": user_to_dict(user_row)}, 201)
 
-    def _handle_login(self, db: DBWrapper):
+    def _handle_login(self, db: sqlite3.Connection):
         body  = self._body()
         email = (body.get("email") or "").strip().lower()
         password = body.get("password") or ""
@@ -1574,13 +1576,13 @@ class Handler(BaseHTTPRequestHandler):
         token = gen_token()
         now = utcnow()
         db.execute(
-            "INSERT INTO sessions (token, user_id, created_at) VALUES (?,?,?) ON CONFLICT (token) DO UPDATE SET user_id=EXCLUDED.user_id, created_at=EXCLUDED.created_at",
+            "INSERT OR REPLACE INTO sessions (token, user_id, created_at) VALUES (?,?,?)",
             (token, user["id"], now),
         )
         db.commit()
         self._json({"token": token, "user": user_to_dict(user)})
 
-    def _handle_logout(self, db: DBWrapper):
+    def _handle_logout(self, db: sqlite3.Connection):
         token = self._token()
         if token:
             db.execute("DELETE FROM sessions WHERE token=?", (token,))
@@ -1589,17 +1591,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Feed ----
 
-    def _handle_feed(self, db: DBWrapper, qs: dict):
+    def _handle_feed(self, db: sqlite3.Connection, qs: dict):
         category = qs.get("category", "")
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
         limit = min(limit, 100)
 
         user = self._user(db)
-        items, total = _build_feed(db, user=user, category=category, is_short=False, page=page, limit=limit)
+        items, total = _build_feed(db, user=user, category=category, page=page, limit=limit)
         self._json({"items": items, "total": total, "page": page})
 
-    def _handle_video_get(self, db: DBWrapper, vid_id: str):
+    def _handle_video_get(self, db: sqlite3.Connection, vid_id: str):
         row = db.execute(
             """SELECT v.*, u.avatar_url, u.is_verified
                FROM videos v JOIN users u ON u.id=v.creator_id
@@ -1612,21 +1614,15 @@ class Handler(BaseHTTPRequestHandler):
 
         user = self._user(db)
         liked = saved = following = False
-        prog = 0.0
         if user:
             uid = user["id"]
-            liked     = bool(db.execute("SELECT 1 FROM likes WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
-            saved     = bool(db.execute("SELECT 1 FROM saves WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
+            liked   = bool(db.execute("SELECT 1 FROM likes WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
+            saved   = bool(db.execute("SELECT 1 FROM saves WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone())
             following = bool(db.execute("SELECT 1 FROM follows WHERE follower_id=? AND creator_id=?", (uid, row["creator_id"])).fetchone())
-            hr = db.execute("SELECT progress FROM history WHERE user_id=? AND video_id=?", (uid, vid_id)).fetchone()
-            if hr:
-                prog = float(hr["progress"] or 0)
 
-        d = video_to_dict(row, liked=liked, saved=saved, following=following)
-        d["progress"] = prog
-        self._json({"video": d})
+        self._json({"video": video_to_dict(row, liked=liked, saved=saved, following=following)})
 
-    def _handle_shorts(self, db: DBWrapper, qs: dict):
+    def _handle_shorts(self, db: sqlite3.Connection, qs: dict):
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
         limit = min(limit, 100)
@@ -1634,7 +1630,7 @@ class Handler(BaseHTTPRequestHandler):
         items, total = _build_feed(db, user=user, is_short=True, page=page, limit=limit)
         self._json({"items": items, "total": total, "page": page})
 
-    def _handle_search(self, db: DBWrapper, qs: dict):
+    def _handle_search(self, db: sqlite3.Connection, qs: dict):
         q        = qs.get("q", "").strip()
         category = qs.get("category", "")
         page     = int(qs.get("page", 0))
@@ -1649,7 +1645,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Video Interactions ----
 
-    def _handle_like(self, db: DBWrapper, vid_id: str):
+    def _handle_like(self, db: sqlite3.Connection, vid_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1676,7 +1672,6 @@ class Handler(BaseHTTPRequestHandler):
             )
             db.execute("UPDATE videos SET like_count=like_count+1 WHERE id=?", (vid_id,))
             liked = True
-            _log_daily_stat(db, vid_id, "likes")
 
             # notification for video creator (not self-like)
             if video["creator_id"] != uid:
@@ -1693,7 +1688,7 @@ class Handler(BaseHTTPRequestHandler):
         new_count = db.execute("SELECT like_count FROM videos WHERE id=?", (vid_id,)).fetchone()["like_count"]
         self._json({"liked": liked, "likeCount": new_count})
 
-    def _handle_save(self, db: DBWrapper, vid_id: str):
+    def _handle_save(self, db: sqlite3.Connection, vid_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1710,7 +1705,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if existing:
             db.execute("DELETE FROM saves WHERE user_id=? AND video_id=?", (uid, vid_id))
-            db.execute("UPDATE videos SET save_count=MAX(0, save_count-1) WHERE id=?", (vid_id,))
             saved = False
         else:
             now = utcnow()
@@ -1718,14 +1712,12 @@ class Handler(BaseHTTPRequestHandler):
                 "INSERT INTO saves (user_id, video_id, created_at) VALUES (?,?,?)",
                 (uid, vid_id, now),
             )
-            db.execute("UPDATE videos SET save_count=save_count+1 WHERE id=?", (vid_id,))
             saved = True
-            _log_daily_stat(db, vid_id, "saves")
 
         db.commit()
         self._json({"saved": saved})
 
-    def _handle_watch(self, db: DBWrapper, vid_id: str):
+    def _handle_watch(self, db: sqlite3.Connection, vid_id: str):
         body          = self._body()
         watch_time    = float(body.get("watchTime", 0))
         completion    = float(body.get("completionRate", 0))
@@ -1751,14 +1743,13 @@ class Handler(BaseHTTPRequestHandler):
                     (progress, watch_time, completion, now, uid, vid_id),
                 )
             else:
-                # First watch → increment views
+                # First watch ΓåÆ increment views
                 db.execute(
                     """INSERT INTO history (user_id, video_id, progress, watch_time, completion_rate, viewed_at)
                        VALUES (?,?,?,?,?,?)""",
                     (uid, vid_id, progress, watch_time, completion, now),
                 )
                 db.execute("UPDATE videos SET views=views+1 WHERE id=?", (vid_id,))
-                _log_daily_stat(db, vid_id, "views")
 
             db.execute(
                 "UPDATE videos SET watch_time_total=watch_time_total+? WHERE id=?",
@@ -1780,7 +1771,7 @@ class Handler(BaseHTTPRequestHandler):
             # ---- Track skip signal ----
             try:
                 if completion < 0.15:
-                    # User skipped this video early — record it
+                    # User skipped this video early ΓÇö record it
                     db.execute(
                         """INSERT INTO video_skips (user_id, video_id, skip_rate, skipped_at)
                            VALUES (?,?,?,?)
@@ -1789,7 +1780,7 @@ class Handler(BaseHTTPRequestHandler):
                         (uid, vid_id, completion, now),
                     )
                 else:
-                    # User watched enough — remove any prior skip record
+                    # User watched enough ΓÇö remove any prior skip record
                     db.execute(
                         "DELETE FROM video_skips WHERE user_id=? AND video_id=?",
                         (uid, vid_id),
@@ -1800,7 +1791,6 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # Anonymous: just increment views every time
             db.execute("UPDATE videos SET views=views+1 WHERE id=?", (vid_id,))
-            _log_daily_stat(db, vid_id, "views")
             _update_recent_views(db, vid_id)
 
         db.commit()
@@ -1808,7 +1798,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Comments ----
 
-    def _handle_comments_get(self, db: DBWrapper, vid_id: str, qs: dict):
+    def _handle_comments_get(self, db: sqlite3.Connection, vid_id: str, qs: dict):
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
         limit = min(limit, 100)
@@ -1826,7 +1816,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [comment_to_dict(r) for r in rows], "total": total})
 
-    def _handle_comment_post(self, db: DBWrapper, vid_id: str):
+    def _handle_comment_post(self, db: sqlite3.Connection, vid_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1853,7 +1843,6 @@ class Handler(BaseHTTPRequestHandler):
             (cid, vid_id, user["id"], user["name"], user["handle"], content, 0, now),
         )
         db.execute("UPDATE videos SET comment_count=comment_count+1 WHERE id=?", (vid_id,))
-        _log_daily_stat(db, vid_id, "comments")
 
         # notification for video creator (not self-comment)
         if video["creator_id"] != user["id"]:
@@ -1873,7 +1862,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Follows ----
 
-    def _handle_follow(self, db: DBWrapper, creator_id: str):
+    def _handle_follow(self, db: sqlite3.Connection, creator_id: str):
         user = self._require_user(db)
         if not user:
             return
@@ -1928,7 +1917,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- User Profiles ----
 
-    def _handle_user_profile(self, db: DBWrapper, user_id: str):
+    def _handle_user_profile(self, db: sqlite3.Connection, user_id: str):
         u = db.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         if not u:
             self._error("User not found", 404)
@@ -1964,7 +1953,7 @@ class Handler(BaseHTTPRequestHandler):
             "videoCount": video_count,
         })
 
-    def _handle_user_update(self, db: DBWrapper, user):
+    def _handle_user_update(self, db: sqlite3.Connection, user):
         body = self._body()
         uid  = user["id"]
 
@@ -1992,7 +1981,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Upload ----
 
-    def _handle_upload_init(self, db: DBWrapper, user):
+    def _handle_upload_init(self, db: sqlite3.Connection, user):
         body         = self._body()
         filename     = (body.get("filename") or "").strip()
         content_type = (body.get("contentType") or "application/octet-stream").strip()
@@ -2024,65 +2013,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"uploadUrl": upload_url, "mediaUrl": media_url, "key": key})
 
-    def _handle_upload_proxy(self, db: DBWrapper, user):
-        """
-        Phone streams raw file bytes here.
-        Server uploads to R2 via boto3 (server-to-R2 works; phone-to-R2 fails on some ISPs).
-        Returns { mediaUrl, key }.
-        """
-        content_type  = self.headers.get("Content-Type", "application/octet-stream")
-        content_length = int(self.headers.get("Content-Length", 0) or 0)
-        upload_type   = (self.headers.get("X-Upload-Type") or "video").strip().lower()
-        filename      = (self.headers.get("X-Filename") or "upload.bin").strip()
-
-        if content_length <= 0:
-            self._error("Content-Length required", 400)
-            return
-        if content_length > 2 * 1024 * 1024 * 1024:  # 2 GB hard limit
-            self._error("File too large (max 2 GB)", 413)
-            return
-
-        # Read the raw bytes streamed from the phone
-        data = self.rfile.read(content_length)
-
-        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
-
-        # Route to correct bucket
-        if upload_type == "thumbnail" or content_type.startswith("image/"):
-            bucket, pub_url = R2_THUMBNAILS_BUCKET, R2_THUMBNAILS_PUBLIC_URL
-            key = f"thumbnails/{new_id()}.{ext}"
-        elif upload_type == "short":
-            bucket, pub_url = R2_SHORTS_BUCKET, R2_SHORTS_PUBLIC_URL
-            key = f"shorts/{new_id()}.{ext}"
-        else:
-            bucket, pub_url = R2_BUCKET_NAME, R2_PUBLIC_URL
-            key = f"videos/{new_id()}.{ext}"
-
-        # Upload from server to R2 (this always works — server can reach R2)
-        try:
-            s3_client = boto3.client(
-                "s3",
-                endpoint_url=R2_ENDPOINT,
-                aws_access_key_id=R2_ACCESS_KEY_ID,
-                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-                config=Config(signature_version="s3v4"),
-                region_name="auto",
-            )
-            s3_client.put_object(
-                Bucket=bucket,
-                Key=key,
-                Body=data,
-                ContentType=content_type,
-            )
-        except Exception as exc:
-            print(f"[OFG ERROR] Proxy upload to R2 failed: {exc}")
-            self._error(f"R2 upload failed: {exc}", 500)
-            return
-
-        media_url = r2_public_url(key, pub_url=pub_url, bucket=bucket)
-        self._json({"mediaUrl": media_url, "key": key})
-
-    def _handle_upload(self, db: DBWrapper, user):
+    def _handle_upload(self, db: sqlite3.Connection, user):
         body         = self._body()
         title        = (body.get("title") or "").strip()
         description  = (body.get("description") or "").strip()
@@ -2120,7 +2051,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Creator ----
 
-    def _handle_creator_stats(self, db: DBWrapper, user):
+    def _handle_creator_stats(self, db: sqlite3.Connection, user):
         uid = user["id"]
         stats = db.execute(
             """SELECT
@@ -2169,7 +2100,7 @@ class Handler(BaseHTTPRequestHandler):
             "topCategory": top_category,
         })
 
-    def _handle_creator_videos(self, db: DBWrapper, user, qs: dict):
+    def _handle_creator_videos(self, db: sqlite3.Connection, user, qs: dict):
         uid   = user["id"]
         page  = int(qs.get("page", 0))
         limit = int(qs.get("limit", 20))
@@ -2192,7 +2123,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Library ----
 
-    def _handle_history(self, db: DBWrapper, user):
+    def _handle_history(self, db: sqlite3.Connection, user):
         uid  = user["id"]
         rows = db.execute(
             """SELECT v.*, u.avatar_url, u.is_verified, h.progress
@@ -2212,7 +2143,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": items})
 
-    def _handle_saved(self, db: DBWrapper, user):
+    def _handle_saved(self, db: sqlite3.Connection, user):
         uid  = user["id"]
         rows = db.execute(
             """SELECT v.*, u.avatar_url, u.is_verified
@@ -2228,12 +2159,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Settings ----
 
-    def _handle_settings_get(self, db: DBWrapper, user):
+    def _handle_settings_get(self, db: sqlite3.Connection, user):
         uid  = user["id"]
         rows = db.execute("SELECT key, value FROM settings WHERE user_id=?", (uid,)).fetchall()
         self._json({"settings": {r["key"]: r["value"] for r in rows}})
 
-    def _handle_settings_post(self, db: DBWrapper, user):
+    def _handle_settings_post(self, db: sqlite3.Connection, user):
         body  = self._body()
         key   = (body.get("key") or "").strip()
         value = body.get("value")
@@ -2247,7 +2178,7 @@ class Handler(BaseHTTPRequestHandler):
 
         uid = user["id"]
         db.execute(
-            "INSERT INTO settings (user_id, key, value) VALUES (?,?,?) ON CONFLICT (user_id, key) DO UPDATE SET value=EXCLUDED.value",
+            "INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?,?,?)",
             (uid, key, str(value)),
         )
         db.commit()
@@ -2255,7 +2186,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Notifications ----
 
-    def _handle_notifications_get(self, db: DBWrapper, user):
+    def _handle_notifications_get(self, db: sqlite3.Connection, user):
         uid  = user["id"]
         rows = db.execute(
             """SELECT * FROM notifications WHERE user_id=?
@@ -2274,7 +2205,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Reports ----
 
-    def _handle_report(self, db: DBWrapper, user):
+    def _handle_report(self, db: sqlite3.Connection, user):
         body      = self._body()
         rtype     = (body.get("type") or "").strip()
         target_id = (body.get("targetId") or "").strip()
@@ -2299,7 +2230,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Admin ----
 
-    def _handle_admin_videos(self, db: DBWrapper, qs: dict):
+    def _handle_admin_videos(self, db: sqlite3.Connection, qs: dict):
         status = qs.get("status", "all")
         page   = int(qs.get("page", 0))
         limit  = int(qs.get("limit", 50))
@@ -2327,7 +2258,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [video_to_dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_admin_feature(self, db: DBWrapper, vid_id: str):
+    def _handle_admin_feature(self, db: sqlite3.Connection, vid_id: str):
         video = db.execute("SELECT id, is_featured FROM videos WHERE id=?", (vid_id,)).fetchone()
         if not video:
             self._error("Video not found", 404)
@@ -2337,7 +2268,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"ok": True, "featured": bool(new_val)})
 
-    def _handle_admin_ban(self, db: DBWrapper, user_id: str):
+    def _handle_admin_ban(self, db: sqlite3.Connection, user_id: str):
         u = db.execute("SELECT id, is_banned FROM users WHERE id=?", (user_id,)).fetchone()
         if not u:
             self._error("User not found", 404)
@@ -2349,7 +2280,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"ok": True, "banned": bool(new_val)})
 
-    def _handle_admin_reports(self, db: DBWrapper, qs: dict):
+    def _handle_admin_reports(self, db: sqlite3.Connection, qs: dict):
         status = qs.get("status", "pending")
         page   = int(qs.get("page", 0))
         limit  = int(qs.get("limit", 50))
@@ -2369,7 +2300,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [report_to_dict(r) for r in rows]})
 
-    def _handle_admin_report_resolve(self, db: DBWrapper, report_id: str):
+    def _handle_admin_report_resolve(self, db: sqlite3.Connection, report_id: str):
         body   = self._body()
         status = (body.get("status") or "").strip()
         if status not in ("resolved", "dismissed"):
@@ -2389,17 +2320,17 @@ class Handler(BaseHTTPRequestHandler):
 
     PLATFORM_FEE_RATE = 0.10  # 10% platform fee
 
-    def _ensure_wallet(self, db: DBWrapper, creator_id: str):
+    def _ensure_wallet(self, db: sqlite3.Connection, creator_id: str):
         """Create a wallet row for creator if one doesn't exist."""
         db.execute(
-            """INSERT INTO creator_wallets
+            """INSERT OR IGNORE INTO creator_wallets
                (creator_id, wallet_balance, lifetime_donations, lifetime_platform_fees,
                 total_supporters, monthly_earnings, pending_payout, updated_at)
-               VALUES (?, 0, 0, 0, 0, 0, 0, ?) ON CONFLICT (creator_id) DO NOTHING""",
+               VALUES (?,0,0,0,0,0,0,?)""",
             (creator_id, utcnow()),
         )
 
-    def _handle_donate(self, db: DBWrapper, user):
+    def _handle_donate(self, db: sqlite3.Connection, user):
         body = self._body()
         creator_id  = body.get("creatorId", "").strip()
         amount      = float(body.get("amount", 0))
@@ -2411,7 +2342,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error("creatorId is required")
             return
         if amount < 10 or amount > 50000:
-            self._error("Amount must be between ₹10 and ₹50,000")
+            self._error("Amount must be between Γé╣10 and Γé╣50,000")
             return
         if creator_id == user["id"]:
             self._error("You cannot donate to yourself")
@@ -2489,7 +2420,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # --- Send notification to creator ---
         donor_label = "Anonymous Supporter" if is_anon else user["name"]
-        notif_msg = f"{donor_label} donated ₹{int(amount)} to your ministry!"
+        notif_msg = f"{donor_label} donated Γé╣{int(amount)} to your ministry!"
         db.execute(
             """INSERT INTO notifications (id, user_id, type, from_user_id, from_user_name,
                video_id, message, is_read, created_at)
@@ -2509,10 +2440,10 @@ class Handler(BaseHTTPRequestHandler):
             "platformFee": platform_fee,
             "creatorAmount": creator_amount,
             "creatorName": creator["name"],
-            "message": "Donation successful! God bless you 🙏",
+            "message": "Donation successful! God bless you ≡ƒÖÅ",
         })
 
-    def _handle_donation_history(self, db: DBWrapper, user, qs: dict):
+    def _handle_donation_history(self, db: sqlite3.Connection, user, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 20)), 100)
         offset = page * limit
@@ -2533,7 +2464,7 @@ class Handler(BaseHTTPRequestHandler):
         items = [dict(r) for r in rows]
         self._json({"items": items, "total": total, "page": page})
 
-    def _handle_creator_wallet_get(self, db: DBWrapper, user):
+    def _handle_creator_wallet_get(self, db: sqlite3.Connection, user):
         self._ensure_wallet(db, user["id"])
         db.commit()
         wallet = db.execute(
@@ -2541,7 +2472,7 @@ class Handler(BaseHTTPRequestHandler):
         ).fetchone()
         self._json(dict(wallet))
 
-    def _handle_public_wallet(self, db: DBWrapper, creator_id: str):
+    def _handle_public_wallet(self, db: sqlite3.Connection, creator_id: str):
         """Public-facing minimal wallet stats (for creator profile page)."""
         wallet = db.execute(
             """SELECT total_supporters, lifetime_donations, monthly_earnings
@@ -2557,7 +2488,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"totalSupporters": 0, "lifetimeDonations": 0.0, "monthlyEarnings": 0.0})
 
-    def _handle_creator_donations_list(self, db: DBWrapper, user, qs: dict):
+    def _handle_creator_donations_list(self, db: sqlite3.Connection, user, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 20)), 100)
         offset = page * limit
@@ -2582,7 +2513,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_creator_payouts_list(self, db: DBWrapper, user, qs: dict):
+    def _handle_creator_payouts_list(self, db: sqlite3.Connection, user, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 20)), 100)
         offset = page * limit
@@ -2599,13 +2530,13 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_creator_payout_request(self, db: DBWrapper, user):
+    def _handle_creator_payout_request(self, db: sqlite3.Connection, user):
         body = self._body()
         amount = float(body.get("amount", 0))
 
         MIN_PAYOUT = 500.0
         if amount < MIN_PAYOUT:
-            self._error(f"Minimum payout is ₹{int(MIN_PAYOUT)}")
+            self._error(f"Minimum payout is Γé╣{int(MIN_PAYOUT)}")
             return
 
         self._ensure_wallet(db, user["id"])
@@ -2619,7 +2550,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error("Please connect a payout account first")
             return
         if wallet["wallet_balance"] < amount:
-            self._error(f"Insufficient balance. Available: ₹{wallet['wallet_balance']:.2f}")
+            self._error(f"Insufficient balance. Available: Γé╣{wallet['wallet_balance']:.2f}")
             return
 
         # Check for pending payout already
@@ -2650,7 +2581,7 @@ class Handler(BaseHTTPRequestHandler):
         db.commit()
         self._json({"ok": True, "payoutId": payout_id, "status": "pending"})
 
-    def _handle_creator_payout_account(self, db: DBWrapper, user):
+    def _handle_creator_payout_account(self, db: sqlite3.Connection, user):
         body = self._body()
         account = str(body.get("payoutAccount", "")).strip()
         if not account:
@@ -2666,7 +2597,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Admin Donation Handlers ----
 
-    def _handle_admin_donations(self, db: DBWrapper, qs: dict):
+    def _handle_admin_donations(self, db: sqlite3.Connection, qs: dict):
         page  = int(qs.get("page", 0))
         limit = min(int(qs.get("limit", 30)), 100)
         offset = page * limit
@@ -2705,7 +2636,7 @@ class Handler(BaseHTTPRequestHandler):
             "page": page,
         })
 
-    def _handle_admin_payouts(self, db: DBWrapper, qs: dict):
+    def _handle_admin_payouts(self, db: sqlite3.Connection, qs: dict):
         page   = int(qs.get("page", 0))
         limit  = min(int(qs.get("limit", 30)), 100)
         offset = page * limit
@@ -2728,7 +2659,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"items": [dict(r) for r in rows], "total": total, "page": page})
 
-    def _handle_admin_payout_approve(self, db: DBWrapper, payout_id: str):
+    def _handle_admin_payout_approve(self, db: sqlite3.Connection, payout_id: str):
         payout = db.execute(
             "SELECT * FROM payouts WHERE id=?", (payout_id,)
         ).fetchone()
@@ -2764,13 +2695,13 @@ class Handler(BaseHTTPRequestHandler):
                video_id, message, is_read, created_at)
                VALUES (?,?,'payout','','OFG Admin','',?,0,?)""",
             (secrets.token_hex(12), payout["creator_id"],
-             f"Your payout of ₹{payout['amount']:.0f} has been approved and sent!",
+             f"Your payout of Γé╣{payout['amount']:.0f} has been approved and sent!",
              now),
         )
         db.commit()
         self._json({"ok": True, "status": "paid"})
 
-    def _handle_admin_payout_reject(self, db: DBWrapper, payout_id: str):
+    def _handle_admin_payout_reject(self, db: sqlite3.Connection, payout_id: str):
         body = self._body()
         reason = str(body.get("reason", "Rejected by admin")).strip()
 
@@ -2804,7 +2735,7 @@ class Handler(BaseHTTPRequestHandler):
                video_id, message, is_read, created_at)
                VALUES (?,?,'payout','','OFG Admin','',?,0,?)""",
             (secrets.token_hex(12), payout["creator_id"],
-             f"Your payout of ₹{payout['amount']:.0f} was rejected: {reason}",
+             f"Your payout of Γé╣{payout['amount']:.0f} was rejected: {reason}",
              now),
         )
         db.commit()
@@ -2816,7 +2747,7 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def run():
-    print("[OFG] Initializing database …")
+    print("[OFG] Initializing database ΓÇª")
     init_db()
     print(f"[OFG] OFG Connects server starting on http://{OFG_HOST}:{OFG_PORT}")
     server = ThreadingHTTPServer((OFG_HOST, OFG_PORT), Handler)
