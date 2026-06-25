@@ -1514,7 +1514,7 @@ class Handler(BaseHTTPRequestHandler):
         limit = min(limit, 100)
 
         user = self._user(db)
-        items, total = _build_feed(db, user=user, category=category, page=page, limit=limit)
+        items, total = _build_feed(db, user=user, category=category, is_short=False, page=page, limit=limit)
         self._json({"items": items, "total": total, "page": page})
 
     def _handle_video_get(self, db: DBWrapper, vid_id: str):
